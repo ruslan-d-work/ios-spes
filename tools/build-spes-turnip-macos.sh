@@ -50,8 +50,8 @@ nm = '/usr/bin/nm'
 pkg-config = 'false'
 [built-in options]
 c_args = ['-Wno-error=incompatible-function-pointer-types']
-c_link_args = ['-Wl,-ios_version_min,16.0', '-Wl,-fixup_chains']
-cpp_link_args = ['-Wl,-ios_version_min,16.0', '-Wl,-fixup_chains']
+c_link_args = ['-Wl,-ios_version_min,16.0']
+cpp_link_args = ['-Wl,-ios_version_min,16.0']
 [host_machine]
 system = 'darwin'
 subsystem = 'ios'
