@@ -1,3 +1,26 @@
+# Moved to a Linux desktop without the Mac's files; rebuild inventory, 2026-11-05
+
+Observed:
+- Host: Linux checkout of the fork ruslan-d-work/ios-spes (upstream AdyaGMD/ios-spes). The Mac is not
+  available now. research/, shim/out/, dtb/, backup/ and all root copies/deltas are absent (git-ignored).
+  Only the repo is here. Free disk 35 GB (after the user cleaned up).
+- Phone on USB: Android 13 (spesn, slot b, TKQ1.221114.001 test-keys), /data is f2fs, so this userdata
+  holds no iOS root at the moment. flash.locked=0, verifiedbootstate=orange, no su. The user has not yet
+  said whether this is the same handset. Nothing was written to the phone.
+- 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
+  (Run 40690358957 from the 2026-10-28 entry is 404 from this fork.) No image built, not booted.
+- Host tools present: fastboot, adb, gh, clang, python3, mkfs.hfsplus/fsck.hfsplus, /dev/fuse. Missing:
+  apfs-fuse, an AArch64 GNU toolchain, ipsw, lzfse. sudo needs the user's password.
+
+Rebuild needs (from the scripts; none run yet):
+- Linux: IPSW OS/SystemOS/AppOS -> tools/mkiosroot.sh + sweet-root-tweaks.py; d22ap.adt from the IPSW;
+  dtb/spes-live.dtb from a root context (OrangeFox by temporary fastboot boot; recovery not in the repo).
+- macOS-only scripts, needed for the Metal test: build-spes-{mesa,turnip,eagl,metal}-macos.sh,
+  build-spes-audio-hal.sh (SDK clang, codesign). Idea, untested: run them on the macos-15 Actions runner.
+- Root batches 1-11 and probe jobs lived in research/ and survive only as descriptions in this file, so
+  the rebuilt root will not be byte-identical. Compare 0169 only with a rebuilt 0169-off baseline.
+- Installing the root overwrites Android userdata: requires the user's explicit confirmation first.
+
 # all48 garbled -> 0168 reverted; 0169 cached-PTE experiment, 2026-10-28
 
 - all48 log research/spes-all48-boot.txt (5790 lines, flush #16): every created
