@@ -30,8 +30,8 @@ jobs:
       - name: Host tools
         run: |
           brew install bison flex llvm ninja glslang
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
-          sudo xcode-select -s "$XC"
+          # The runner's default Xcode: 16.0's linker drops LC_DYLD_CHAINED_FIXUPS with -undefined
+          # dynamic_lookup, and the old format imports dyld_stub_binder, local in the 20H392 libdyld.
           xcodebuild -version
           echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
           rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-apple-ios
