@@ -1,0 +1,137 @@
+USB on spes: DWC3 at khaje addresses, opt-in with sweetusb (0170).
+
+The CDC-ECM gadget and live UDP log of 0072-0077 worked on sweet. spes kept them off because
+the addresses were SM7150's. Observed on a spesn live DT: ssusb@4e00000 (QSCRATCH at +0xf8800,
+as the driver assumes), gdsc@141a004 in GCC 0x1400000, hsphy@1613000 (SNPS femto), SMMU SID 0x120;
+CBCR offsets from Linux gcc-khaje.c. sweetusb=1 only reads state and reads DWC3 only with the GDSC
+and clocks on; sweetusb=2 passes SID 0x120 through the SMMU (the DMA buffers are above 4 GiB)
+and starts the device. Not given: USB stays off. Untested on hardware. ABL leaving the
+controller clocked, in device mode with the femto PHY set up, is assumed from sweet: =1 checks it.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -777,14 +777,19 @@
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_touch_init();
+-	/* PMIC keys need separate spes validation; never start the USB driver. */
++	/* PMIC keys need separate spes validation; USB only with an explicit sweetusb=1 or 2. */
+ 	DTEntry platform;
+ 	if (SecureDTLookupEntry(NULL, "/spes-platform", &platform) == kSuccess) {
+ 		/* Live spes FDT matches PM6125 PON and GPIO5. Opt-in test only. */
+ 		int keys = 0;
+ 		(void)PE_parse_boot_argn("sweetkeys", &keys, sizeof(keys));
+ 		if (keys == 1) sweet_keys_init();
+-		printf("SPES: PMIC keys %s; USB disabled\n", keys == 1 ? "requested" : "disabled");
++		int usb = 0;
++		(void)PE_parse_boot_argn("sweetusb", &usb, sizeof(usb));
++		printf("SPES: PMIC keys %s; USB %s\n", keys == 1 ? "requested" : "disabled", usb ? "requested" : "disabled");
++		if (usb) {
++			sweet_usb_probe();
++		}
+ 		spes_cpufreq_init();
+ 		spes_vib_init();
+ 		spes_amp_init();
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -38,6 +39,7 @@
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern bool spes_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -57,6 +59,23 @@
+ 	{ "clkref", 0x8c010 },
+ };
+ 
++/*
++ * spes (khaje, SM6225): live DT ssusb@4e00000, hsphy@1613000 (SNPS femto, not QUSB2),
++ * gdsc@141a004, SMMU SID 0x120; CBCR offsets from Linux gcc-khaje.c, same order as above.
++ */
++#define SPES_GCC_PA             0x01400000
++#define SPES_GCC_SIZE           0x001f0000
++#define SPES_GCC_USB30_GDSCR    0x1a004
++#define SPES_DWC3_PA            0x04e00000
++#define SPES_QSCRATCH_PA        0x04ef8800
++#define SPES_USB_SID            0x120
++
++static const uint32_t usb_cbcr_spes[] = {
++	0x1a010, 0x1a014, 0x1a018, 0x1a084, 0x1a080, 0x1d008, 0x9f000,
++};
++
++static bool usb_is_spes;
++
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+@@ -82,15 +101,17 @@
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	DTEntry platform;
++	usb_is_spes = SecureDTLookupEntry(NULL, "/spes-platform", &platform) == kSuccess;
++	vm_offset_t gcc = usb_is_spes ? ml_io_map(SPES_GCC_PA, SPES_GCC_SIZE) : ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	gdscr = usb_rd(gcc, usb_is_spes ? SPES_GCC_USB30_GDSCR : GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++		cbcr[i] = usb_rd(gcc, usb_is_spes ? usb_cbcr_spes[i] : usb_cbcr[i].off);
+ 		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+@@ -100,7 +121,7 @@
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+ 	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	vm_offset_t dwc = ml_io_map(usb_is_spes ? SPES_DWC3_PA : DWC3_PA, DWC3_SIZE);
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+@@ -116,6 +137,9 @@
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++	if (usb_is_spes) {
++		return;         /* the QUSB2 registers below do not exist on spes */
++	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+@@ -818,6 +842,11 @@
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	/* Our DMA buffers are physical addresses above 4 GiB: pass this stream through the SMMU. */
++	if (usb_is_spes && !spes_smmu_identity(SPES_USB_SID, 0, "USB")) {
++		printf("SWEET USB: SID 0x%x not passed through\n", SPES_USB_SID);
++		return;
++	}
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+@@ -866,7 +895,7 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	vm_offset_t qs = ml_io_map(usb_is_spes ? SPES_QSCRATCH_PA : QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
