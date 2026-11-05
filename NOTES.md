@@ -1,3 +1,18 @@
+# HANDOFF 2026-11-05 late: iOS on spesn with USB, SSH, Metal UI, Wi-Fi, apt, Sileo installed
+
+Read the entries below for details. State at the end of the session:
+- Boot: phone in fastboot (power + vol down), then fastboot boot shim/out/spes-wifi1.img (0171 kernel: USB, Metal,
+  modem=1 wifi=1). Plain power-on goes to OrangeFox (boot_b). Host: NM profile ios-spes-usb; live log nc -ukl 5140.
+  Reboot over SSH hangs at 'hfs: unmount initiated': use a forced reset.
+- ONLY ON THE PHONE (not in research/spes-ios-root.img, a reflash loses them): Procursus 1800 tools, dpkg/apt with
+  sources.list.d/procursus.list, Sileo (uicache -p done), Metal bundle + /redwood/bin, /var/db/negronimetal/env
+  TU_DEBUG=noconform,sysmem, clients with backboardd and com.apple.WebKit.GPU, network service, time zone Etc/GMT-2.
+  Before any reflash, copy these into the image and add a configd restart or seeded network prefs for the first boot.
+- Clock resets to 1969 on each boot: run date -u -s over SSH until an NTP job exists (TLS and Sileo need it).
+- Open: Safari shows only the wallpaper; Metal UI artifacts; Sileo opening not yet confirmed (see below); audio
+  not built; real battery level; more RAM (1 GiB now, idea: extend down to ~0xc0000000); boot_a image for PC-less
+  start. Do not run apt upgrade blindly (9 upgrades offered, untested). _apt user missing: apt warns, still works.
+
 # Moved to a Linux desktop without the Mac's files; rebuild inventory, 2026-11-05
 
 Observed:
