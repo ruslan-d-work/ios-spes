@@ -33,7 +33,12 @@ Observed:
   iOS + Metal in 1 GiB is unproven. Using more RAM means moving XNU's base below 4 GiB, which collides with
   the scanout pool (0x80000000-0xc0000000, patch 0116) and SpesModem pool (0xe0000000).
 - spes-diagnostic.img (0169 kernel, baseline, rd=md0, ufsrw=0 rootrw=0 sweetlog=0) temp-booted on spesn
-  2026-11-05, sha256 32356f410728...; result depends on the user's screen report.
+  2026-11-05, sha256 32356f410728.... RESULT (user's photos, no serial log): XNU boots on spesn in the 1 GiB
+  range, no panic: "*** SWEET userspace: init running as PID 1 ***" then repeated "SWEET init: still alive".
+  Display: MDP VIG0 src 0x5c000000 stride 0x10e0, direct scanout on, panel 59.998 Hz, AppleCLCD 1080x2400
+  presented as 1125x2436. CPU 1/1 (cpus=1 in this image). Only the kernel/RAM init/display are proven: UFS,
+  touch, modem, Wi-Fi, audio, GPU are not yet tested on this handset. SpesModem's embedded modem_a extents
+  (NOTES 2026-10) came from the spes firmware, so expect them to differ here (guess, unchecked).
 - The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
   confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
