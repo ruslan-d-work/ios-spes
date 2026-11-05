@@ -64,6 +64,7 @@ Observed:
   OrangeFox: first 16 GiB of userdata sha256 d98f3b4f9f37... = research/spes-ios-root.img. boot_b = OrangeFox
   recovery.img (rc=0), boot_a untouched. spes-ios.img temp-booted 18:07:48 UTC: verbose, then Apple logo ~16 min, then LOCK SCREEN on spesn (base root, cpus=1, no GPU, 1 GiB, ~18:23 UTC, user report). Opening Settings: screen dims and the animation seems to hang (not yet known whether hung or just slow). NOTE: after a
   sparse flash, give ABL no timed-out queries: use a forced reset if it hangs.
+- First boot log research/spes-boot1.txt (use grep -a: it holds binary bytes): no panic and no jetsam entries; exec Preferences ran and did not crash; touch-to-swap up to 786-880 ms; SpringBoard at ~16 min. bluetoothd/fairplayd exec loops (115 each) and touch errors stopping at 14658 are known from earlier notes. Conclusion (inference): slow, not hung: 1 CPU + software rendering. Next: cpus=6 sweetkeys=1 via SWEET_CPUS/SWEET_KEYS in tools/build-spes-ios.sh, shim/out/spes-ios-6cpu.img.
 - User's priority order after first boot: USB first (sweetusb=2 driver 0072-0077 worked on sweet; DWC3 here at
   0x4e00000, hsphy 0x1613000, ssphy 0x1615000, SMMU SID 0x120; iOS needs an IONetworkInterface for ue0), then
   Sileo. Later idea: flash the iOS image to boot_a to start without a PC (untested; retry counter risk).
