@@ -5,8 +5,18 @@ Observed:
   available now. research/, shim/out/, dtb/, backup/ and all root copies/deltas are absent (git-ignored).
   Only the repo is here. Free disk 35 GB (after the user cleaned up).
 - Phone on USB: Android 13 (spesn, slot b, TKQ1.221114.001 test-keys), /data is f2fs, so this userdata
-  holds no iOS root at the moment. flash.locked=0, verifiedbootstate=orange, no su. The user has not yet
-  said whether this is the same handset. Nothing was written to the phone.
+  holds no iOS root at the moment. flash.locked=0, verifiedbootstate=orange, no su. Nothing was written
+  to the phone.
+- ROLLBACK VERSION of this phone (read 2026-11-05 before any wipe): Redmi Note 11 NFC, model 2201117TY,
+  codename spesn, EEA, HyperOS OS1.0.11.0.TGKEUXM (V816.0.11.0.TGKEUXM), Android 13 TKQ1.221114.001,
+  security patch 2025-02-01, build date 2025-03-24, slot _b, kernel 4.19.157-perf-g36804397d7d2, baseband
+  MPSS.HA.1.1.c1-00027-KD_ALL_PACK-3.21298.20. Roll back only with spesn EEA (TGKEUXM) firmware.
+- HANDSET MISMATCH: every earlier entry describes ro.product.device=spes, slot _a, global TGCMIXM firmware
+  (2026-10-18/20). This phone reports spesn (NFC). The user says it is the phone "where we made the backup",
+  but that backup is not in this repo's records and backup/spes-20261020 was taken from a spes. Do NOT
+  restore spes backups (persist, modemst, fsg, ...) to this phone. All spes bring-up is unverified on spesn.
+- The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
+  confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
   (Run 40690358957 from the 2026-10-28 entry is 404 from this fork.) No image built, not booted.
 - Host tools present: fastboot, adb, gh, clang, python3, mkfs.hfsplus/fsck.hfsplus, /dev/fuse. Missing:
