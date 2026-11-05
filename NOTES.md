@@ -54,8 +54,16 @@ Observed:
   https://bigota.d.miui.com/OS1.0.11.0.TGKEUXM/ (also bn.d.miui.com, cdnorg.d.miui.com). Download target
   research/rollback/. After a rollback, restore persist/modemst/fsg only from /home/ruslan/spes-backup if
   they are damaged. Use flash_all (not flash_all_lock).
-- Planned install, awaiting the user's final OK: fastboot -S 512M flash userdata research/spes-ios-root.img,
-  then fastboot boot shim/out/spes-ios.img. In a normal shell "!" negates: it only works in Claude's prompt.
+- The user gave the final OK 2026-11-05 to erase Android userdata and also to flash OrangeFox "just in case".
+  Plan: after the rollback tgz is verified: fastboot -S 512M flash userdata research/spes-ios-root.img; fastboot
+  flash boot_b research/orangefox/recovery.img (no recovery partition exists; active slot only, boot_a stays
+  stock; undo with spes-backup/boot_b.img); fastboot boot shim/out/spes-ios.img. In a normal shell "!" negates:
+  it only works in Claude's prompt.
+- OrangeFox-R12.0-spes.zip (targets spes,spesn; recovery.img sha256 b621bb8d85c2...) temp-booted on this phone:
+  root adb, hwname spesn. Extra backup /home/ruslan/spes-backup/extra-20261105: 77 more partitions (<=256 MiB,
+  skipping userdata, super, system, vendor, product, cust and whole-disk sda/sde) + current persist, modemst1/2,
+  SHA256SUMS, each compared with the phone. Original backup: vendor_boot, boot, fsg, fsc, dtbo, vbmeta equal the
+  phone; persist and modemst1/2 differ (changed since 11-03), so prefer the extra copies for those.
 - The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
   confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
