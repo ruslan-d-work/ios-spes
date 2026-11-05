@@ -59,6 +59,14 @@ Observed:
   flash boot_b research/orangefox/recovery.img (no recovery partition exists; active slot only, boot_a stays
   stock; undo with spes-backup/boot_b.img); fastboot boot shim/out/spes-ios.img. In a normal shell "!" negates:
   it only works in Claude's prompt.
+- DONE 2026-11-05: Android userdata ERASED. fastboot -S 512M flash userdata finished 17:56:27 UTC rc=0 (362 s,
+  24 chunks, "Writing 0.000s" each); ABL then stopped answering getvar until a forced reset. Readback from
+  OrangeFox: first 16 GiB of userdata sha256 d98f3b4f9f37... = research/spes-ios-root.img. boot_b = OrangeFox
+  recovery.img (rc=0), boot_a untouched. spes-ios.img temp-booted 18:07:48 UTC, result pending. NOTE: after a
+  sparse flash, give ABL no timed-out queries: use a forced reset if it hangs.
+- User's priority order after first boot: USB first (sweetusb=2 driver 0072-0077 worked on sweet; DWC3 here at
+  0x4e00000, hsphy 0x1613000, ssphy 0x1615000, SMMU SID 0x120; iOS needs an IONetworkInterface for ue0), then
+  Sileo. Later idea: flash the iOS image to boot_a to start without a PC (untested; retry counter risk).
 - OrangeFox-R12.0-spes.zip (targets spes,spesn; recovery.img sha256 b621bb8d85c2...) temp-booted on this phone:
   root adb, hwname spesn. Extra backup /home/ruslan/spes-backup/extra-20261105: 77 more partitions (<=256 MiB,
   skipping userdata, super, system, vendor, product, cust and whole-disk sda/sde) + current persist, modemst1/2,
