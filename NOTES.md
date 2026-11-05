@@ -39,6 +39,10 @@ Observed:
   presented as 1125x2436. CPU 1/1 (cpus=1 in this image). Only the kernel/RAM init/display are proven: UFS,
   touch, modem, Wi-Fi, audio, GPU are not yet tested on this handset. SpesModem's embedded modem_a extents
   (NOTES 2026-10) came from the spes firmware, so expect them to differ here (guess, unchecked).
+- spes-storage-probe.img (sha256 f6645984e593...) on spesn, user's photo: "SWEET UFS: userdata on LUN 0: first
+  block 0x2b4c28, 43699 MiB, read-only, DMA at 0x103430000", "SPES UFS PROBE: result=0", then PID 1. Size
+  matches fastboot's 0xAAB3D3000. Writes were blocked; UFS writes are still untested on this handset.
+- tools/mkiosroot.sh started by the user 2026-11-05 ~19:29 local (research/spes-ios-root.img, 16G), running.
 - The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
   confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
