@@ -13,7 +13,7 @@ python3 tools/mkadt.py shim/out/spes-ios.adt --device spes --memory-dtb "$fdt"
 cpus=${SWEET_CPUS:-1}
 keys=${SWEET_KEYS:-0}
 python3 tools/mkpayload.py "$kernel" shim/out/spes-ios.adt shim/out/spes-ios-fixed.payload \
-    --cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 ufsrw=1 rootrw=1 sweetlog=1 ufslogsecs=10 sweettouch=1 sweettouchdelay=5 sweettouchdiag=3 sweetkeys=$keys sweethw=0 sweetfb_stayon=1 sweetfb_noconsole=1"
+    --cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsroot=userdata unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 ufsrw=1 rootrw=1 sweetlog=1 ufslogsecs=10 sweettouch=1 sweettouchdelay=5 sweettouchdiag=3 sweetkeys=$keys sweethw=0 sweetfb_stayon=1 sweetfb_noconsole=1${SWEET_EXTRA_ARGS:+ $SWEET_EXTRA_ARGS}"
 BOOT_HEADER_VERSION=3 shim/build.sh out/spes-ios-fixed.payload
 cp shim/out/shim-boot.img shim/out/spes-ios.img
 shasum -a 256 shim/out/spes-ios.img > shim/out/spes-ios.img.sha256
