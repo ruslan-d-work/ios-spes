@@ -14,6 +14,7 @@ concurrency:
 
 env:
   HACKIOS_SHA: 906425b75e02b4f99eb5d7bb1ef7c9583472d772
+  HACKIOS_TURNIP_SHA: b4c5513e2df93689895d21fd3b93b723a7bcfdd3
   IOSPLUS10_SHA: c0a451f
   FLAME_SHA: 745c4341af86089efb0df851fa8a27fb8face624
   M2V_SHA: 720ef1ce9ae2a2068999a8675717418b9416283e
@@ -38,7 +39,13 @@ jobs:
       - name: Sources
         run: |
           mkdir -p research/mesa-build
-          fetch() { git clone -q "https://github.com/$1.git" "research/$2" && git -C "research/$2" checkout -q "$3"; }
+          # Pinned commits may be off every branch: ask for them by hash when the clone lacks them.
+          fetch() {
+            [ -d "research/$2" ] || git clone -q "https://github.com/$1.git" "research/$2"
+            git -C "research/$2" cat-file -e "$3^{commit}" 2>/dev/null || git -C "research/$2" fetch -q origin "$3"
+            git -C "research/$2" checkout -q "$3"
+          }
+          fetch oosexgang/hackios-xnu-kernel hackios "$HACKIOS_TURNIP_SHA"
           fetch oosexgang/hackios-xnu-kernel hackios "$HACKIOS_SHA"
           fetch akshaynexus/iOSPlus10 iOSPlus10 "$IOSPLUS10_SHA"
           fetch NWylynko/ios-flame ios-flame "$FLAME_SHA"
