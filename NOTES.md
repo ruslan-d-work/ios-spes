@@ -12,9 +12,18 @@ Observed:
   security patch 2025-02-01, build date 2025-03-24, slot _b, kernel 4.19.157-perf-g36804397d7d2, baseband
   MPSS.HA.1.1.c1-00027-KD_ALL_PACK-3.21298.20. Roll back only with spesn EEA (TGKEUXM) firmware.
 - HANDSET MISMATCH: every earlier entry describes ro.product.device=spes, slot _a, global TGCMIXM firmware
-  (2026-10-18/20). This phone reports spesn (NFC). The user says it is the phone "where we made the backup",
-  but that backup is not in this repo's records and backup/spes-20261020 was taken from a spes. Do NOT
+  (2026-10-18/20). This phone reports spesn (NFC), so backup/spes-20261020 was taken from a spes. Do NOT
   restore spes backups (persist, modemst, fsg, ...) to this phone. All spes bring-up is unverified on spesn.
+- This phone's own backup: /home/ruslan/spes-backup (made by the user 2026-11-03, outside the repo). live
+  DTB model "SPESN KHAJE IDP nopmi", cmdline hwname=spesn, slot _b, dtb_idx 8, dtbo_idx 3; boot strings
+  V816.0.11.0.TGKEUXM. SHA256SUMS: 11/11 OK, but vendor_boot_a/b are not listed. Contains boot, dtbo, vbmeta,
+  vendor_boot (a/b), persist, modemst1/2, fsg, fsc, live.dtb/dts, cmdline, iomem. Not in it: xbl, xbl_config,
+  abl, modem, vbmeta_system, metadata, misc, devinfo, frp, keystore, secdata, userdata. Copied live.dtb to
+  dtb/spes-live.dtb (ignored). Fastboot: product spesn, slot b, unlocked, anti 1, userdata f2fs 0xAAB3D3000.
+- IPSW members for build 20H392 in research/ipsw-x (OS 087-86698-044, SystemOS 087-86593-047, AppOS
+  087-86715-047). d22ap.adt not extracted yet: needs an LZFSE decoder (apt lzfse).
+- apfs-fuse: cloned by the user at /home/ruslan/research/apfs-fuse (66b86bd), no build/ directory there, so
+  it is not built. The agent's own clone+build was refused by the auto-mode classifier.
 - The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
   confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
