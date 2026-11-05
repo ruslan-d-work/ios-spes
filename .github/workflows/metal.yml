@@ -1,0 +1,80 @@
+name: metal
+
+# Builds Turnip and the NegroniMetal userland (tools/build-spes-{turnip,metal}-macos.sh) on a
+# macOS runner. Sources are pinned by the scripts. Output links against the SDK only; no IPSW or
+# device files are used. metal2vulkan is GPL-2.0+/LGPL-3.0+ and linked statically: the artifact
+# carries SOURCES.txt, and this workflow and those scripts are how to rebuild it.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: metal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HACKIOS_SHA: 906425b75e02b4f99eb5d7bb1ef7c9583472d772
+  IOSPLUS10_SHA: c0a451f
+  FLAME_SHA: 745c4341af86089efb0df851fa8a27fb8face624
+  M2V_SHA: 720ef1ce9ae2a2068999a8675717418b9416283e
+  RUST_VERSION: 1.98.0
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tools
+        run: |
+          brew install bison flex llvm ninja glslang
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-apple-ios
+
+      - name: Sources
+        run: |
+          mkdir -p research/mesa-build
+          fetch() { git clone -q "https://github.com/$1.git" "research/$2" && git -C "research/$2" checkout -q "$3"; }
+          fetch oosexgang/hackios-xnu-kernel hackios "$HACKIOS_SHA"
+          fetch akshaynexus/iOSPlus10 iOSPlus10 "$IOSPLUS10_SHA"
+          fetch NWylynko/ios-flame ios-flame "$FLAME_SHA"
+          fetch steelbrain/metal2vulkan metal2vulkan "$M2V_SHA"
+          curl -fsSL -o research/mesa-build/mesa-25.0.7.tar.xz https://archive.mesa3d.org/mesa-25.0.7.tar.xz
+          tar -xJf research/mesa-build/mesa-25.0.7.tar.xz -C research/mesa-build
+          python3 -m venv research/mesa-build/venv
+          research/mesa-build/venv/bin/pip install -q meson mako pyyaml packaging
+
+      - name: Turnip
+        run: tools/build-spes-turnip-macos.sh research/hackios research/iOSPlus10 "$IOS_SDK"
+
+      - name: NegroniMetal
+        run: >
+          tools/build-spes-metal-macos.sh research/iOSPlus10 research/ios-flame research/metal2vulkan
+          "$IOS_SDK" research/turnip-build/libvulkan_freedreno.dylib
+
+      - name: Package
+        run: |
+          st=research/metal-build/stage
+          {
+            echo "ios-spes $GITHUB_SHA"
+            echo "SDK $IOS_SDK"
+            xcodebuild -version
+            echo "hackios-xnu-kernel $HACKIOS_SHA"
+            echo "iOSPlus10 $IOSPLUS10_SHA"
+            echo "ios-flame $FLAME_SHA"
+            echo "metal2vulkan $M2V_SHA"
+            echo "mesa 25.0.7"
+            echo "rust $RUST_VERSION"
+          } > "$st/SOURCES.txt"
+          (cd "$st" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 shasum -a 256 > SHA256SUMS)
+          cat "$st/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metal-stage
+          path: research/metal-build/stage/
+          if-no-files-found: error
