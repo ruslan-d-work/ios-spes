@@ -22,8 +22,18 @@ Observed:
   dtb/spes-live.dtb (ignored). Fastboot: product spesn, slot b, unlocked, anti 1, userdata f2fs 0xAAB3D3000.
 - IPSW members for build 20H392 in research/ipsw-x (OS 087-86698-044, SystemOS 087-86593-047, AppOS
   087-86715-047). d22ap.adt not extracted yet: needs an LZFSE decoder (apt lzfse).
-- apfs-fuse: cloned by the user at /home/ruslan/research/apfs-fuse (66b86bd), no build/ directory there, so
-  it is not built. The agent's own clone+build was refused by the auto-mode classifier.
+- apfs-fuse (66b86bd, /home/ruslan/research/apfs-fuse) built by the user, /usr/local/bin/apfs-fuse; lzfse
+  installed; research/ipsw-x/d22ap.adt extracted (bvx2 payload at im4p offset 59..33709, 61 /product props).
+- tools/mkbootimg-v3.py replaces tools/mkbootimg (that wrapper hard-codes a Mac path):
+  MKBOOTIMG=$PWD/tools/mkbootimg-v3.py.
+- THIS PHONE HAS 4 GB RAM: live /memory banks 0x40000000+0x3dd00000, 0x80000000+0x40000000,
+  0xc0000000+0x80000000, ending at 0x140000000 (the spes handset had 6 GB). tools/spes_memory.py therefore
+  selects 0x100000000 + 0x40000000 = 1 GiB, not 3 GiB. Android's iomem shows 0x13b400000-0x13bbfffff and
+  0x13bcc5000-0x13fbfffff reserved inside that range; whether those are firmware-owned is NOT checked.
+  iOS + Metal in 1 GiB is unproven. Using more RAM means moving XNU's base below 4 GiB, which collides with
+  the scanout pool (0x80000000-0xc0000000, patch 0116) and SpesModem pool (0xe0000000).
+- spes-diagnostic.img (0169 kernel, baseline, rd=md0, ufsrw=0 rootrw=0 sweetlog=0) temp-booted on spesn
+  2026-11-05, sha256 32356f410728...; result depends on the user's screen report.
 - The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
   confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
