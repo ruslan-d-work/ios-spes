@@ -42,7 +42,20 @@ Observed:
 - spes-storage-probe.img (sha256 f6645984e593...) on spesn, user's photo: "SWEET UFS: userdata on LUN 0: first
   block 0x2b4c28, 43699 MiB, read-only, DMA at 0x103430000", "SPES UFS PROBE: result=0", then PID 1. Size
   matches fastboot's 0xAAB3D3000. Writes were blocked; UFS writes are still untested on this handset.
-- tools/mkiosroot.sh started by the user 2026-11-05 ~19:29 local (research/spes-ios-root.img, 16G), running.
+- spes-touch-probe.img (sha256 b8ba28e41cfd...) on spesn: the user reports touch works (no photo, near-crack
+  zones not reported). The front glass is cracked at the top right.
+- research/spes-ios-root.img (16G, 12G used): mkiosroot.sh + sweet-root-tweaks.py, log
+  research/apply-tweaks.log, TWEAKS-OK, fsck clean. Base root only: no Mesa/Turnip/Metal/audio HAL, none of
+  batches 1-11. NOT on the phone; userdata is still Android.
+- shim/out/spes-ios.img (0169 kernel, build-spes-ios.sh: cpus=1, rd=ufsroot0 ufsrw=1 rootrw=1 sweetlog=1),
+  sha256 a663b181c5e4...: built, not booted. Do not boot it before the root is installed: it opens userdata rw.
+- ROLLBACK PACKAGE (official fastboot ROM, date matches the phone's build):
+  spesn_eea_global_images_OS1.0.11.0.TGKEUXM_20250324.0000.00_13.0_eea_aa692107e0.tgz, 5766435033 bytes,
+  https://bigota.d.miui.com/OS1.0.11.0.TGKEUXM/ (also bn.d.miui.com, cdnorg.d.miui.com). Download target
+  research/rollback/. After a rollback, restore persist/modemst/fsg only from /home/ruslan/spes-backup if
+  they are damaged. Use flash_all (not flash_all_lock).
+- Planned install, awaiting the user's final OK: fastboot -S 512M flash userdata research/spes-ios-root.img,
+  then fastboot boot shim/out/spes-ios.img. In a normal shell "!" negates: it only works in Claude's prompt.
 - The user approved in principle (2026-11-05) wiping Android here, and wants a fresh backup first. Still
   confirm immediately before the actual write.
 - 0169 kernel: fork CI 42067527468 on bdc2682 SUCCESS, xnu/out-0169, SHA256 a3061d38ef16...539b, SHA OK.
