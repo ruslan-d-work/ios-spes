@@ -265,6 +265,8 @@ if __name__ == '__main__':
     ap.add_argument('out')
     ap.add_argument('--device', choices=['topaz', 'spes'], default='topaz')
     ap.add_argument('--memory-dtb', help='live /sys/firmware/fdt (stock images have no RAM map)')
+    ap.add_argument('--low-ram', action='store_true',
+                    help='spes: XNU from 0xa0000000; the kernel must have patch 0172')
     ap.add_argument('--dump', action='store_true')
     ap.add_argument('--qemu', action='store_true')
     ap.add_argument('--highmem', action='store_true')
@@ -273,7 +275,7 @@ if __name__ == '__main__':
         memory = None
         if args.memory_dtb:
             from spes_memory import select_memory
-            memory = select_memory(open(args.memory_dtb, 'rb').read())
+            memory = select_memory(open(args.memory_dtb, 'rb').read(), low_ram=args.low_ram)
         root = build(qemu=args.qemu, highmem=args.highmem, device=args.device, memory=memory)
     except ValueError as e:
         ap.error(str(e))

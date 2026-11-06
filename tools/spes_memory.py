@@ -5,6 +5,9 @@ ABL fills /memory; the placeholder in stock vendor_boot is deliberately rejected
 """
 import struct
 
+# Below this: the shim's load area, the scanout pool (0x90000000 + 192 MB), the modem pool (0x9c000000 + 16 MB).
+LOW_RAM_BASE = 0xa0000000
+
 
 def parse(blob):
     def words(offset, count):
@@ -60,7 +63,18 @@ def parse(blob):
     raise ValueError('unterminated FDT reservations')
 
 
-def select_memory(blob):
+def merge_banks(banks):
+    merged = []
+    for base, size in sorted(banks):
+        if merged and merged[-1][0] + merged[-1][1] == base:
+            merged[-1] = (merged[-1][0], merged[-1][1] + size)
+        else:
+            merged.append((base, size))
+    return merged
+
+
+def select_memory(blob, low_ram=False):
+    """low_ram: start at LOW_RAM_BASE. Needs a kernel with patch 0172 (modem pool moved)."""
     nodes, reserved = parse(blob)
     root = nodes.get('', {})
     if b'qcom,khaje\0' not in root.get('compatible', b''):
@@ -93,8 +107,11 @@ def select_memory(blob):
                 if not allocation or any(b + s > 0x100000000 for b, s in allocation):
                     raise ValueError('unresolved dynamic reservation above 4 GiB')
     candidates = []
-    for base, size in banks:
-        spans = [(max(base, 0x100000000), min(base + size, 0x400000000))]
+    floor = LOW_RAM_BASE if low_ram else 0x100000000
+    for base, size in merge_banks(banks):
+        if base + size <= floor:
+            continue
+        spans = [(max(base, floor), min(base + size, 0x400000000))]
         for rb, rs in reserved:
             spans = [(a, b) for lo, hi in spans for a, b in
                      ((lo, min(hi, rb)), (max(lo, rb + rs), hi)) if a < b]

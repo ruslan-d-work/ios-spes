@@ -1,0 +1,23 @@
+Move SpesModem's pool from 0xE0000000 to 0x9C000000, so XNU can own 0xA0000000-0x140000000.
+
+spesn has 4 GB: RAM runs without a hole from 0x80000000 to 0x140000000, and the live DT has no
+fixed reservation above 0x80000000. XNU only took 0x100000000 + 1 GiB. Measured on 2026-11-06: 601 MB
+wired and 287 MB in the compressor left ~130 MB for everything else, with ~48 MB/s of page-ins.
+The pool's old address is the one thing of ours in the way. The new place is right behind the scanout
+pool (0x90000000 + 12 x 16 MB) and still below 4 GiB and 0xF0000000 for TZ and the modem.
+
+An ADT from mkadt.py --low-ram REQUIRES this kernel: older kernels would use the pool inside XNU's RAM.
+
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -44,7 +44,8 @@
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+-/* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+-#define MODEM_POOL_BASE     0xE0000000ull
++/* RAM the kernel does not manage, behind the scanout pool (0x90000000 + 192 MB, SweetSurface);
++ * below 0xF0000000 for TZ/the modem. XNU starts at 0xA0000000 (mkadt.py --low-ram). */
++#define MODEM_POOL_BASE     0x9C000000ull
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+ #define SMEM_PA             0x46000000ull
