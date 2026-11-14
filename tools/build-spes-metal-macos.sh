@@ -46,6 +46,10 @@ PY
     case "$(basename "$p")" in 0003-*) p="$b/0003-spes-a610-device-answers.patch" ;; esac
     patch -s -p1 --batch --no-backup-if-mismatch -d "$fs" < "$p"; echo "flame: $(basename "$p")"
   done
+  # ours (userland/metal-patches/flame): off unless /var/db/negronimetal/env asks (NEGRONIMETAL_TRACE, NEGRONIMETAL_DONTCARE)
+  for p in "$root"/userland/metal-patches/flame/*.patch; do
+    patch -s -p1 --batch --no-backup-if-mismatch -d "$fs" < "$p"; echo "flame: spes $(basename "$p")"
+  done
   touch "$b/src/.patched"
 fi
 # the bridge: a static library over metal2vulkan (iOSPlus10 scripts/metal/build-bridge.sh)

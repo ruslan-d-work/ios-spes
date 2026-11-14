@@ -1,0 +1,477 @@
+spes change to the ios-flame Metal frontend (745c434 + iOSPlus10 flame/0001-0007), applied by tools/build-spes-metal-macos.sh:
+a diagnostic for pictures that come out wrong (App Library, 2026-11-14: the blurred backdrop covers only the top third of the
+screen, black below). Nothing changes unless /var/db/negronimetal/env sets one of:
+- NEGRONIMETAL_TRACE=1: after `touch /var/db/negronimetal/trace` the next 120 command buffers (NEGRONIMETAL_TRACE_COUNT) are
+  written to /var/db/negronimetal/trace.log as the client asked for them: each render pass (attachments with size, format,
+  level, slice, load action asked and given, store action, renderTargetWidth/Height), pipeline function names, viewports,
+  scissors, textures bound, the first floats of vertex buffers and setBytes blocks, draws, blit copies with origins and sizes,
+  generateMipmaps, dispatches, new textures and views. Passes whose largest side is under NEGRONIMETAL_TRACE_MIN (64) are left out.
+- NEGRONIMETAL_TRACE=3: also, after each traced encoder, 8 rows of every target (1/16 ... 15/16 of its height) are copied to a
+  buffer by a blit encoder of our own on the same command buffer, and logged at completion as y<row>:<non-zero %>/<mean byte>:
+  the first target whose lower rows are 0 while its sources' are not is where the picture is lost.
+- NEGRONIMETAL_DONTCARE=clear|load|first|keep: what a DontCare colour attachment that is not an IOSurface loads. clear is
+  flame/0002's behaviour and the default (the whole level is cleared to zero at every such pass); load keeps the texture's
+  contents (tests whether a pass that redraws part of a texture loses the rest to that clear); first clears a level the first
+  time a render pass targets it and loads after that (new textures still read as zero); keep hands DontCare to the runtime.
+Why the DontCare knob (read in the pinned sources, not yet tried on the phone): metal2vulkan-runtime src/clear_reach.rs (720ef1ce,
+lines 21-46) records Apple's measured DontCare load (M3 Max, M4): tiles a draw touches start as zero, tiles no primitive touches
+keep their texels; and the runtime already does that itself, clearing only the tiles the draws' viewports and scissors reach.
+flame/0002 turns every such DontCare into a Clear before the runtime sees it, so the whole level goes to zero: redundant for the
+touched tiles and wrong for the rest. If CoreAnimation draws part of a texture in a DontCare pass (a band of a blur, one slot of
+a cache), everything outside that part is lost. NEGRONIMETAL_DONTCARE=keep is Metal's behaviour as the runtime has it: try it first.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm	2026-11-14 13:16:06.932931338 +0200
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm	2026-11-14 13:21:59.826345718 +0200
+@@ -11,6 +11,8 @@
+ #import <IOSurface/IOSurfaceRef.h>
+ #import <objc/runtime.h>
+ #include <algorithm>
++#include <cstdarg>
++#include <unistd.h>
+ #include <atomic>
+ #include <mutex>
+ #include <pthread.h>
+@@ -154,10 +156,94 @@
+ @property(nonatomic) IOSurfaceRef surface;
+ @property(nonatomic) NSUInteger offset,rowBytes;
+ @property(nonatomic) NSUInteger parentLevel,parentSlice;   // NegroniMetal: a view's first level and slice in its parent
++@property(nonatomic) uint64_t passSeen;   // spes: the levels and slices (bit level*4+slice) a render pass has targeted (NEGRONIMETAL_DONTCARE=first)
+ @property(nonatomic,strong) id<MTLTexture> parent;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+ @property(nonatomic) NSUInteger heapOffset;
+ @end
++// spes (userland/metal-patches/flame/0001): a call trace of what the client asks of each render pass, blit and dispatch, to settle
++// where a picture goes wrong (App Library: the blurred backdrop covers only the top third). Off unless NEGRONIMETAL_TRACE is set in
++// /var/db/negronimetal/env (bit 0: calls; bit 1: also read 8 rows of every traced target back after its encoder, through a blit
++// encoder of our own on the same command buffer, and log how much of each row is non-zero). Nothing is traced until the file
++// SPES_TRACE_TRIGGER exists: it is removed and the next NEGRONIMETAL_TRACE_COUNT command buffers (default 120) are written to
++// SPES_TRACE_LOG. Passes whose largest target side is under NEGRONIMETAL_TRACE_MIN pixels (default 64) are left out.
++// NEGRONIMETAL_DONTCARE chooses what a DontCare colour attachment that is not an IOSurface loads: clear (flame/0002, the default),
++// load (keep the texture's contents), first (clear the first time a pass targets a level, load after that) or keep (DontCare as asked).
++#define SPES_TRACE_TRIGGER "/var/db/negronimetal/trace"
++#define SPES_TRACE_LOG "/var/db/negronimetal/trace.log"
++static int gTrace,gTraceCount=120,gDontCare=1;
++static uint64_t gTraceMin=64;
++static std::atomic<int> gTraceLeft;
++static std::atomic<uint32_t> gTraceSeq;
++static std::atomic<uint64_t> gTraceChecked;
++static std::atomic<bool> gTraceStuck;
++static std::mutex gTraceLock;
++static FILE *gTraceFile;
++static void traceLine(const char *format,...) __attribute__((format(printf,1,2)));
++static void traceLine(const char *format,...) {
++ std::lock_guard<std::mutex> lock(gTraceLock);
++ if(!gTraceFile)gTraceFile=fopen(SPES_TRACE_LOG,"a");
++ if(!gTraceFile)return;
++ va_list args;va_start(args,format);vfprintf(gTraceFile,format,args);va_end(args);
++ fputc('\n',gTraceFile);
++}
++static void traceFlush() {std::lock_guard<std::mutex> lock(gTraceLock);if(gTraceFile)fflush(gTraceFile);}
++// A new command buffer's trace number, 0 for one that is not traced. Looks for the trigger at most five times a second.
++static uint32_t traceBegin() {
++ if(!gTrace)return 0;
++ if(gTraceLeft.load()<=0) {
++  if(gTraceStuck.load())return 0;
++  const uint64_t now=nowUs();uint64_t seen=gTraceChecked.load();
++  if(now-seen<200000 || !gTraceChecked.compare_exchange_strong(seen,now))return 0;
++  if(access(SPES_TRACE_TRIGGER,F_OK)!=0)return 0;
++  if(unlink(SPES_TRACE_TRIGGER)!=0)gTraceStuck=true;   // cannot remove it: trace once, not for ever
++  gTraceLeft=gTraceCount;
++  traceLine("== armed: %d command buffers, min %llu px, trace %d, dontcare %d, pid %d %s",gTraceCount,(unsigned long long)gTraceMin,gTrace,
++            gDontCare,(int)getpid(),getprogname());
++ }
++ if(gTraceLeft.fetch_sub(1)<=0){gTraceLeft=0;return 0;}
++ return ++gTraceSeq;
++}
++static bool traceBig(id t) {
++ if(![t isKindOfClass:[NBTexture class]])return false;
++ const NmbTextureDescriptor d=[(NBTexture *)t descriptor];
++ return std::max(d.width,d.height)>=gTraceMin;
++}
++// T<object> WxH f<format> L<levels> A<array> S<samples> u<usage> o<options>, surf/buf for an IOSurface or buffer texture, and a view's parent.
++static std::string traceTex(id t) {
++ if(!t)return "nil";
++ if(![t isKindOfClass:[NBTexture class]])return "foreign";
++ NBTexture *x=(NBTexture *)t;const NmbTextureDescriptor d=x.descriptor;char b[240];
++ snprintf(b,sizeof b,"T%p %llux%llu f%llu L%llu A%llu S%llu u0x%llx o0x%llx%s",(__bridge void *)x,(unsigned long long)d.width,
++          (unsigned long long)d.height,(unsigned long long)d.format,(unsigned long long)d.levels,(unsigned long long)d.array_length,
++          (unsigned long long)d.samples,(unsigned long long)d.usage,(unsigned long long)d.options,x.surface?" surf":x.buffer?" buf":"");
++ std::string s=b;
++ if(x.parent) {
++  snprintf(b,sizeof b," view(T%p L%lu S%lu)",(__bridge void *)x.parent,(unsigned long)x.parentLevel,(unsigned long)x.parentSlice);s+=b;
++ }
++ return s;
++}
++// The first floats of a vertex or uniform block, as they are when it is set.
++static void traceFloats(const char *what,uint32_t stage,NSUInteger index,const void *bytes,uint64_t length) {
++ char text[480];text[0]=0;int n=0;const uint64_t count=std::min<uint64_t>(length/4,24);
++ for(uint64_t i=0;bytes && i<count;i++){float f;memcpy(&f,(const char *)bytes+i*4,4);n+=snprintf(text+n,sizeof text-(size_t)n," %.5g",(double)f);}
++ traceLine("  %s s%u i%lu len %llu:%s",what,stage,(unsigned long)index,(unsigned long long)length,text);
++}
++// Eight rows of a traced target, copied into `buffer` by the command buffer itself and summed up when it completes.
++struct TraceRead {NmbBuffer *buffer;uint64_t row,height;std::string what;};
++// NEGRONIMETAL_DONTCARE=first: whether a render pass has targeted this level and slice of the texture (through any view) before; marks it.
++// Past level 15 or slice 3 the answer is always no (such a target is cleared every time, as under =clear).
++static bool passSeenBefore(NBTexture *texture,NSUInteger level,NSUInteger slice) {
++ for(int depth=0;depth<8 && texture.parent && [(id)texture.parent isKindOfClass:[NBTexture class]];depth++) {
++  level+=texture.parentLevel;slice+=texture.parentSlice;texture=(NBTexture *)texture.parent;
++ }
++ if(level>15 || slice>3)return false;
++ const uint64_t bit=1ull<<(level*4+slice);
++ const bool seen=(texture.passSeen&bit)!=0;
++ texture.passSeen|=bit;
++ return seen;
++}
++
+ @implementation NBBuffer
+ - (void)dealloc {
+  if(_deallocator)noteNoCopyDealloc(self);   // NegroniMetal (flame/0006)
+@@ -260,6 +346,7 @@
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
+  if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
++ if(gTraceLeft.load()>0 && traceBig(view))traceLine("view %s",traceTex(view).c_str());   // spes trace
+  return (id<MTLTexture>)view;
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
+@@ -505,6 +592,7 @@
+ @end
+ @interface NBRenderPipeline : NBObject
+ @property(nonatomic) NmbRenderPipeline *handle;
++@property(nonatomic,copy) NSString *traceName;   // spes trace: vertex / fragment function names
+ @end
+ @implementation NBRenderPipeline
+ - (void)dealloc {nmb_render_pipeline_release(_handle);}
+@@ -582,6 +670,8 @@
+ @public
+  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
+  uint64_t createdUs;
++ uint32_t traced;                      // spes trace: this command buffer's number in the trace, 0 if it is not traced
++ std::vector<TraceRead> traceReads;    // spes trace: rows to sum up in -finish
+ }
+ @property(nonatomic) NmbCommandBuffer *handle;
+ @property(nonatomic,strong) NBQueue *queue;
+@@ -606,7 +696,44 @@
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+ @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+-@end
++@property(nonatomic) BOOL trace;                              // spes trace: this encoder's calls are written out
++@property(nonatomic,strong) NSMutableArray *traceTargets;     // spes trace: @[texture, level, slice] to read back at endEncoding
++- (void)traceTarget:(id)texture level:(NSUInteger)level slice:(NSUInteger)slice;
++@end
++static uint64_t sweetTexelBytes(MTLPixelFormat f);
++// spes trace: copy eight rows (at 1/16, 3/16 ... 15/16 of the height) of each target into a buffer, after the encoder that wrote it.
++static void traceReadRows(NBCommandBuffer *commandBuffer,NSArray *targets) {
++ if(commandBuffer.committed || commandBuffer.encodeFailure)return;
++ for(NSArray *target in targets) {
++  NBTexture *texture=target[0];const NmbTextureDescriptor d=texture.descriptor;
++  const uint64_t level=[target[1] unsignedLongLongValue],slice=[target[2] unsignedLongLongValue];
++  const uint64_t texel=sweetTexelBytes((MTLPixelFormat)d.format);
++  const uint64_t storage=(d.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift;
++  if(d.type!=MTLTextureType2D || d.samples>1 || storage==3 /* memoryless */) {
++   traceLine("  rows T%p: not read (type %llu samples %llu storage %llu)",(__bridge void *)texture,(unsigned long long)d.type,
++             (unsigned long long)d.samples,(unsigned long long)storage);
++   continue;
++  }
++  const uint64_t width=std::max<uint64_t>(d.width>>level,1),height=std::max<uint64_t>(d.height>>level,1),row=width*texel;
++  NmbBuffer *buffer=nmb_buffer_new(gDevice,row*8,MTLResourceStorageModeShared,nullptr);
++  NmbEncoder *blit=buffer?nmb_blit_encoder_new(commandBuffer.handle):nullptr;
++  if(!blit) {
++   traceLine("  rows T%p: no buffer or blit encoder: %s",(__bridge void *)texture,nmb_last_error());
++   if(buffer)nmb_buffer_release(buffer);
++   continue;
++  }
++  bool ok=true;
++  for(uint64_t k=0;k<8 && ok;k++) {
++   const uint64_t origin[3]={0,(2*k+1)*height/16,0},size[3]={width,1,1};
++   ok=nmb_blit_texture_to_buffer(blit,texture.handle,slice,level,origin,size,buffer,k*row,row,row);
++  }
++  if(!ok)traceLine("  rows T%p: copy refused: %s",(__bridge void *)texture,nmb_last_error());
++  nmb_encoder_end(blit);
++  if(!ok){nmb_buffer_release(buffer);continue;}
++  char what[64];snprintf(what,sizeof what,"T%p L%llu",(__bridge void *)texture,(unsigned long long)level);
++  commandBuffer->traceReads.push_back(TraceRead{buffer,row,height,what});
++ }
++}
+ static void waitForResource(id resource) {
+  const uint64_t began=nowUs();
+  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+@@ -643,6 +770,13 @@
+  NmbEncoder *handle=_handle;_handle=nullptr;
+  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
+  [self check:nmb_encoder_end(handle) what:"endEncoding"];
++ if(_trace)traceLine("  end");   // spes trace
++ if(_traceTargets){traceReadRows(_commandBuffer,_traceTargets);_traceTargets=nil;}
++}
++- (void)traceTarget:(id)texture level:(NSUInteger)level slice:(NSUInteger)slice {
++ if(!(gTrace&2) || !_commandBuffer->traced || !traceBig(texture))return;
++ if(!_traceTargets)_traceTargets=[NSMutableArray array];
++ if(_traceTargets.count<4)[_traceTargets addObject:@[texture,@(level),@(slice)]];
+ }
+ - (void)insertDebugSignpost:(NSString *)s {(void)s;}
+ - (void)pushDebugGroup:(NSString *)s {(void)s;}
+@@ -651,6 +785,10 @@
+ - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
+  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
++ if(_trace && buffer && stage==1) {   // spes trace: the vertices (or the vertex stage's uniforms) as they are now
++  const NSUInteger length=[(NBBuffer *)buffer length];const char *contents=(const char *)[(NBBuffer *)buffer contents];
++  traceFloats("vbuf",stage,index,contents && offset<length?contents+offset:nullptr,offset<length?length-offset:0);
++ }
+  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
+ }
+ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
+@@ -658,6 +796,7 @@
+  if(texture)[_commandBuffer.resourceOwners addObject:texture];
+  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+  if(texture && (texture.usage&MTLTextureUsageShaderWrite))[_commandBuffer wroteTexture:texture];   // NegroniMetal: may be written
++ if(_trace)traceLine("  tex s%u i%lu %s",stage,(unsigned long)index,traceTex(texture).c_str());   // spes trace
+  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ }
+ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
+@@ -665,6 +804,7 @@
+  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+ }
+ - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
++ if(_trace)traceFloats("bytes",stage,index,bytes,length);   // spes trace
+  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
+ }
+ - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
+@@ -728,6 +868,8 @@
+  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+  if(![self dispatchAllowed])return;
+  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
++ if(self.trace)traceLine("  dispatch %s %llux%llux%llu per group %llux%llux%llu",threads?"threads":"groups",(unsigned long long)s[0],
++                         (unsigned long long)s[1],(unsigned long long)s[2],(unsigned long long)g[0],(unsigned long long)g[1],(unsigned long long)g[2]);
+  if(!nmb_compute_dispatch(self.handle,s,g,threads))
+   noteSkipped([@"dispatch: " stringByAppendingString:lastError()],true);
+ }
+@@ -752,6 +894,7 @@
+   _skipDraws=YES;noteSkipped([@"setRenderPipelineState: " stringByAppendingString:lastError()],false);return;
+  }
+  _skipDraws=NO;
++ if(self.trace)traceLine("  pipeline %s",[(NBRenderPipeline *)state traceName].UTF8String?:"?");   // spes trace
+ }
+ - (bool)drawAllowed {
+  if(_skipDraws)noteSkipped(@"draw after a refused render pipeline",true);
+@@ -783,10 +926,13 @@
+ - (void)setDepthClipMode:(MTLDepthClipMode)depthClipMode {(void)depthClipMode;}
+ - (void)setViewport:(MTLViewport)v {
+  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
++ if(self.trace)traceLine("  viewport %.3f %.3f %.3f %.3f z %.3f %.3f",values[0],values[1],values[2],values[3],values[4],values[5]);   // spes trace
+  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
+ }
+ - (void)setScissorRect:(MTLScissorRect)r {
+  const uint64_t values[4]={r.x,r.y,r.width,r.height};
++ if(self.trace)traceLine("  scissor %llu %llu %llu %llu",(unsigned long long)values[0],(unsigned long long)values[1],(unsigned long long)values[2],
++                         (unsigned long long)values[3]);   // spes trace
+  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
+ }
+ // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
+@@ -824,6 +970,8 @@
+ }
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+  gDraws++;self.commandBuffer->encodedWork.draws++;
++ if(self.trace)traceLine("  draw type %lu start %lu count %lu instances %lu%s",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i,
++                         _skipDraws?" SKIPPED":"");   // spes trace
+  if(![self drawAllowed])return;
+  if(!nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b))noteSkipped([@"drawPrimitives: " stringByAppendingString:lastError()],true);
+ }
+@@ -836,6 +984,8 @@
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
+  gDraws++;self.commandBuffer->encodedWork.draws++;
++ if(self.trace)traceLine("  draw indexed type %lu count %lu instances %lu base %ld%s",(unsigned long)t,(unsigned long)n,(unsigned long)i,(long)v,
++                         _skipDraws?" SKIPPED":"");   // spes trace
+  if(![(id)b isKindOfClass:[NBBuffer class]]){noteSkipped(b?@"drawIndexedPrimitives: foreign index buffer":@"drawIndexedPrimitives: nil index buffer",true);return;}
+  [self.commandBuffer.resourceOwners addObject:b];
+  if(![self drawAllowed])return;
+@@ -887,6 +1037,14 @@
+  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+  [self.commandBuffer wroteTexture:d];
+  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
++ if(self.commandBuffer->traced && (traceBig(s) || traceBig(d))) {   // spes trace
++  traceLine("cb%u blit copy %s slice %lu level %lu at %llu,%llu size %llux%llux%llu",self.commandBuffer->traced,traceTex(s).c_str(),(unsigned long)ss,
++            (unsigned long)sl,(unsigned long long)a[0],(unsigned long long)a[1],(unsigned long long)size[0],(unsigned long long)size[1],
++            (unsigned long long)size[2]);
++  traceLine("  -> %s slice %lu level %lu at %llu,%llu",traceTex(d).c_str(),(unsigned long)ds,(unsigned long)dl,(unsigned long long)b[0],
++            (unsigned long long)b[1]);
++  [self traceTarget:d level:dl slice:ds];
++ }
+  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
+ }
+ - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
+@@ -904,17 +1062,28 @@
+  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+  [self.commandBuffer wroteTexture:d];
+  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
++ if(self.commandBuffer->traced && traceBig(d)) {   // spes trace
++  traceLine("cb%u blit buffer +%lu row %lu image %lu size %llux%llux%llu -> %s slice %lu level %lu at %llu,%llu",self.commandBuffer->traced,
++            (unsigned long)o,(unsigned long)row,(unsigned long)image,(unsigned long long)size[0],(unsigned long long)size[1],
++            (unsigned long long)size[2],traceTex(d).c_str(),(unsigned long)slice,(unsigned long)level,(unsigned long long)b[0],(unsigned long long)b[1]);
++  [self traceTarget:d level:level slice:slice];
++ }
+  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
+ }
+ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
+  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
++ if(self.commandBuffer->traced && traceBig(s))   // spes trace
++  traceLine("cb%u blit to buffer %s slice %lu level %lu at %llu,%llu size %llux%llux%llu row %lu",self.commandBuffer->traced,traceTex(s).c_str(),
++            (unsigned long)slice,(unsigned long)level,(unsigned long long)a[0],(unsigned long long)a[1],(unsigned long long)size[0],
++            (unsigned long long)size[1],(unsigned long long)size[2],(unsigned long)row);
+  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
+ }
+ - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+  if(![self textures:NB_OBJECTS(t) count:1])return;
+  [self.commandBuffer wroteTexture:t];
++ if(self.commandBuffer->traced && traceBig(t))traceLine("cb%u blit generateMipmaps %s",self.commandBuffer->traced,traceTex(t).c_str());   // spes trace
+  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
+ }
+ - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
+@@ -926,6 +1095,7 @@
+ - (instancetype)init {
+  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentedHandlers=[NSMutableArray array];_presents=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self)createdUs=nowUs();
++ if(self)traced=traceBegin();   // spes trace
+  return self;
+ }
+ - (void)dealloc {nmb_command_buffer_release(_handle);}
+@@ -1013,7 +1183,9 @@
+  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+- return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
++ NBComputeEncoder *encoder=[self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
++ if(traced && encoder){encoder.trace=YES;traceLine("cb%u compute",traced);}   // spes trace
++ return (id<MTLComputeCommandEncoder>)encoder;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
+  if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
+@@ -1050,9 +1222,18 @@
+   // rounded-corner masks in DontCare attachments and blends into texels it never wrote, which Apple GPUs start cleared to zero (else: dark
+   // wedges at widget and dock corners). Colour attachments that are not IOSurfaces (masks, intermediates) start cleared to zero; IOSurface
+   // framebuffers are redrawn whole, and a clear there would cost every frame. With Turnip a DontCare load is the same risk in GMEM [I].
+-  if(c.texture && c.loadAction==MTLLoadActionDontCare && ![(NBTexture *)c.texture surface]) {
+-   pass.colors[i].load=MTLLoadActionClear;
+-   pass.colors[i].clear[0]=pass.colors[i].clear[1]=pass.colors[i].clear[2]=pass.colors[i].clear[3]=0;
++  // spes: NEGRONIMETAL_DONTCARE chooses otherwise. load keeps the texture's contents (a pass that draws part of a texture other
++  // passes filled loses the rest to this clear); first clears a level the first time a pass targets it and keeps it after that
++  // (a new texture reads as zero, an old one keeps what it holds, as on a tile-based GPU that skips the tiles nothing touched [I]);
++  // keep passes DontCare on. The default is the clear.
++  if(c.texture && ![(NBTexture *)c.texture surface]) {
++   const bool seen=gDontCare==3 && passSeenBefore((NBTexture *)c.texture,c.level,c.slice);
++   if(c.loadAction==MTLLoadActionDontCare && (gDontCare==2 || seen)) {
++    pass.colors[i].load=MTLLoadActionLoad;
++   } else if(c.loadAction==MTLLoadActionDontCare && gDontCare) {
++    pass.colors[i].load=MTLLoadActionClear;
++    pass.colors[i].clear[0]=pass.colors[i].clear[1]=pass.colors[i].clear[2]=pass.colors[i].clear[3]=0;
++   }
+   }
+  }
+  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+@@ -1063,7 +1244,28 @@
+   [_resourceOwners addObject:d.visibilityResultBuffer];
+   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
+  }
+- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
++ NBRenderEncoder *encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
++ if(traced && encoder) {   // spes trace: what the client asked for, and the load action the runtime was given
++  bool big=traceBig(d.depthAttachment.texture) || traceBig(d.stencilAttachment.texture);
++  for(unsigned i=0;i<8;i++)big=big || traceBig(d.colorAttachments[i].texture);
++  if(big) {
++   encoder.trace=YES;
++   traceLine("cb%u pass renderTarget %lux%lu array %lu samples %lu",traced,(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight,
++             (unsigned long)d.renderTargetArrayLength,(unsigned long)d.defaultRasterSampleCount);
++   for(unsigned i=0;i<8;i++) {
++    MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];if(!c.texture)continue;
++    traceLine("  c%u %s level %lu slice %lu load %lu given %llu store %lu clear %.3f %.3f %.3f %.3f%s",i,traceTex(c.texture).c_str(),(unsigned long)c.level,
++              (unsigned long)c.slice,(unsigned long)c.loadAction,(unsigned long long)pass.colors[i].load,(unsigned long)c.storeAction,c.clearColor.red,
++              c.clearColor.green,c.clearColor.blue,c.clearColor.alpha,c.resolveTexture?" resolve (not passed on)":"");
++    [encoder traceTarget:c.texture level:c.level slice:c.slice];
++   }
++   if(d.depthAttachment.texture)traceLine("  depth %s load %lu store %lu",traceTex(d.depthAttachment.texture).c_str(),(unsigned long)d.depthAttachment.loadAction,
++                                          (unsigned long)d.depthAttachment.storeAction);
++   if(d.stencilAttachment.texture)traceLine("  stencil %s load %lu store %lu",traceTex(d.stencilAttachment.texture).c_str(),
++                                            (unsigned long)d.stencilAttachment.loadAction,(unsigned long)d.stencilAttachment.storeAction);
++  }
++ }
++ return (id<MTLRenderCommandEncoder>)encoder;
+ }
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+@@ -1100,6 +1302,23 @@
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+ - (void)finish {
+  flushSurfaces(_surfaces);
++ // spes trace: the rows read back, as "y<row>:<non-zero bytes, %>/<mean byte>"
++ for(TraceRead &r:traceReads) {
++  const uint8_t *bytes=self.failedLocally?nullptr:(const uint8_t *)nmb_buffer_contents(r.buffer);
++  if(bytes && r.row) {
++   char text[480];text[0]=0;int n=0;
++   for(uint64_t k=0;k<8;k++) {
++    uint64_t nonzero=0,sum=0;
++    for(uint64_t i=0;i<r.row;i++){nonzero+=bytes[k*r.row+i]!=0;sum+=bytes[k*r.row+i];}
++    n+=snprintf(text+n,sizeof text-(size_t)n," y%llu:%llu/%llu",(unsigned long long)((2*k+1)*r.height/16),(unsigned long long)(nonzero*100/r.row),
++                (unsigned long long)(sum/r.row));
++   }
++   traceLine("cb%u rows %s:%s",traced,r.what.c_str(),text);
++  }
++  nmb_buffer_release(r.buffer);
++ }
++ traceReads.clear();
++ if(traced)traceFlush();
+  // NegroniMetal (Chlorophyll src/bgmtl.m bgCompleteFrom:, MIT): a GPU write does not move an IOSurface's seed, but consumers cache by it
+  // (a compositor re-uploads a surface it copied only when the seed moved; Bergamota's CAMetalLayer drawables showed the frame of one cycle
+  // earlier). A write lock and unlock is the defined way to bump the seed. Before the completed handlers, so the consumer that a handler
+@@ -1139,6 +1358,8 @@
+ }
+ - (void)commit {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ if(traced)traceLine("cb%u commit: %u passes %u draws %u dispatches %u blits%s",traced,encodedWork.passes,encodedWork.draws,encodedWork.dispatches,
++                     encodedWork.blits,self.encodeFailure?" REFUSED":"");   // spes trace
+  self.committed=YES;
+  self.committedUs=nowUs();
+  {
+@@ -1680,7 +1901,9 @@
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
++ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
++ if(gTraceLeft.load()>0 && traceBig(texture))traceLine("new %s",traceTex(texture).c_str());   // spes trace
++ return (id<MTLTexture>)texture;
+ }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+@@ -1758,7 +1981,9 @@
+  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
++ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
++ state.traceName=[NSString stringWithFormat:@"%@ / %@",d.vertexFunction.name,d.fragmentFunction.name];   // spes trace
++ return (id<MTLRenderPipelineState>)state;
+ }
+ - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
+  if(d.url && !d.url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+@@ -1854,6 +2079,17 @@
+  gTargetDeviceInfo.name=strdup(name);   // NegroniMetal: lives as long as the process
+  // NegroniMetal: the IOSurface seed bump after GPU writes (-finish): off in backboardd; NEGRONIMETAL_SEED_BUMP=0/1 overrides
+  if(const char *bump=getenv("NEGRONIMETAL_SEED_BUMP"))gSeedBump=bump[0]!='0';else gSeedBump=strcmp(getprogname(),"backboardd")!=0;
++ // spes: the pass trace and the DontCare choice (see SPES_TRACE_TRIGGER above); both from /var/db/negronimetal/env
++ if(const char *t=getenv("NEGRONIMETAL_TRACE"))gTrace=atoi(t);
++ if(const char *t=getenv("NEGRONIMETAL_TRACE_MIN"))gTraceMin=strtoull(t,nullptr,10);
++ if(const char *t=getenv("NEGRONIMETAL_TRACE_COUNT"))gTraceCount=atoi(t)>0?atoi(t):gTraceCount;
++ if(const char *t=getenv("NEGRONIMETAL_DONTCARE"))gDontCare=t[0]=='l'?2:t[0]=='f'?3:t[0]=='k'?0:1;
++ if(gTrace || gDontCare!=1) {
++  char line[200];
++  snprintf(line,sizeof line,"native-metal: spes trace %d (min %llu px, %d command buffers after touch " SPES_TRACE_TRIGGER "), dontcare %s",gTrace,
++           (unsigned long long)gTraceMin,gTraceCount,gDontCare==2?"load":gDontCare==3?"first":gDontCare?"clear":"keep");
++  sm2_logs(line);
++ }
+  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
+  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
+   for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
