@@ -1,0 +1,45 @@
+spes: NEGRONIMETAL_RTSIZE=full does not hand renderTargetWidth/Height to the runtime (flame patch 0002, off by default).
+
+App Library trace (research/trace-20261115/applib1.log): CoreAnimation blurs through pooled textures, e.g. renderTarget 35x35 of
+a 64x64 texture with viewport 64x64 and scissor 35x35; the downsampled picture comes out about 35/64 of its size and the
+upsampled result holds content only in its top rows. The runtime makes the framebuffer renderTarget-sized. This knob makes it
+the whole attachment (viewport and scissor still bound the drawing) to test whether the smaller framebuffer is what breaks.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -172,6 +172,7 @@
+ #define SPES_TRACE_TRIGGER "/var/db/negronimetal/trace"
+ #define SPES_TRACE_LOG "/var/db/negronimetal/trace.log"
+ static int gTrace,gTraceCount=120,gDontCare=1;
++static bool gFullTarget;   // spes: NEGRONIMETAL_RTSIZE=full, see beginRenderPass
+ static uint64_t gTraceMin=64;
+ static std::atomic<int> gTraceLeft;
+ static std::atomic<uint32_t> gTraceSeq;
+@@ -1239,6 +1240,10 @@
+  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
+  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
++ // spes: NEGRONIMETAL_RTSIZE=full hands the runtime no renderTargetWidth/Height when the pass has a colour attachment, so the
++ // framebuffer is the whole attachment. CoreAnimation draws into part of a pooled texture (renderTarget 35x35 of a 64x64 one)
++ // with its own viewport (64x64) and scissor (35x35), which still bound what is drawn; a Clear then clears the whole level.
++ if(gFullTarget && (pass.colors[0].texture || pass.depth.texture)){pass.width=0;pass.height=0;}
+  if(d.visibilityResultBuffer) {
+   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
+   [_resourceOwners addObject:d.visibilityResultBuffer];
+@@ -2081,13 +2086,14 @@
+  if(const char *bump=getenv("NEGRONIMETAL_SEED_BUMP"))gSeedBump=bump[0]!='0';else gSeedBump=strcmp(getprogname(),"backboardd")!=0;
+  // spes: the pass trace and the DontCare choice (see SPES_TRACE_TRIGGER above); both from /var/db/negronimetal/env
+  if(const char *t=getenv("NEGRONIMETAL_TRACE"))gTrace=atoi(t);
++ if(const char *t=getenv("NEGRONIMETAL_RTSIZE"))gFullTarget=strcmp(t,"full")==0;
+  if(const char *t=getenv("NEGRONIMETAL_TRACE_MIN"))gTraceMin=strtoull(t,nullptr,10);
+  if(const char *t=getenv("NEGRONIMETAL_TRACE_COUNT"))gTraceCount=atoi(t)>0?atoi(t):gTraceCount;
+  if(const char *t=getenv("NEGRONIMETAL_DONTCARE"))gDontCare=t[0]=='l'?2:t[0]=='f'?3:t[0]=='k'?0:1;
+  if(gTrace || gDontCare!=1) {
+   char line[200];
+-  snprintf(line,sizeof line,"native-metal: spes trace %d (min %llu px, %d command buffers after touch " SPES_TRACE_TRIGGER "), dontcare %s",gTrace,
+-           (unsigned long long)gTraceMin,gTraceCount,gDontCare==2?"load":gDontCare==3?"first":gDontCare?"clear":"keep");
++  snprintf(line,sizeof line,"native-metal: spes trace %d (min %llu px, %d command buffers after touch " SPES_TRACE_TRIGGER "), dontcare %s, renderTarget size %s",gTrace,
++           (unsigned long long)gTraceMin,gTraceCount,gDontCare==2?"load":gDontCare==3?"first":gDontCare?"clear":"keep",gFullTarget?"not passed on":"passed on");
+   sm2_logs(line);
+  }
+  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
