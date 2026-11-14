@@ -41,6 +41,8 @@
   - Userland on the phone AND in git (userland/scripts): spes-rtc.sh, spes-reboot.sh, spes-gpu-wait.sh (now calls spes-rtc.sh load first).
 - No local Apple clang on this Linux host (~/swift missing): tools/xnu-cc.py cannot run; 0179 went to CI after a stub-header syntax check of spes_pmic.c only, and compiled first time.
 - Cellular in iOS (CommCenter, signal bars, calls, SMS, data) is NOT started: the kernel probe only talks QMI to the modem and logs.
+- Lock screen after display off/on: user confirms it unlocks on k0179 (AKS selector 8 success). One test; cause-and-effect not otherwise proven.
+- Host cleanup 2026-11-15 (user asked): deleted research/camera-fw/vendor.img (vendor_a from the super image inside research/rollback/*.tgz, can be extracted again; extract.log kept) and xnu/out-0169..0172 (CI artifacts). Kept: out-0173, 0177, 0178, 0179.
 - Live log capture: only one nc may listen on 5140; boot 2 went into research/live-fullram1.txt from line 7869.
 - Merged subagent work: 42f7d84 tools, 0174 (fa91347, spesbatt=1), 0176 (f93bc99, wwan=1), 0177 (cf33ac0, gpu_reclaim default ON). CI xnu run 43587042148 started for 0173+0174+0176+0177.
 - Subagent branches (now merged; was: not merged, not built): worktree-agent-a887e5c133bca7808 (bluetoothd loop: exits 0 'No bluetooth on this device', relaunched by clients; tools/spes-disable-bluetoothd.sh), worktree-agent-a7fe2e20c8fe04667 (0176 SPES WWAN QMI probe, wwan=1).
