@@ -1,3 +1,10 @@
+# HANDOFF 2026-11-14: XNU owns 2.84 GiB (0173), agents' side results pending review
+
+- 0173 (commit after 17889ca, CI 43585381641 -> xnu/out-0173, SHA OK): scanout pool 0x90000000 -> 0x64000000, modem pool 0x9C000000 -> 0x70000000 (free low RAM 0x63900000-0x7dcfffff, same in OrangeFox /proc/iomem). mkadt.py --full-ram: XNU 0x8A000000 + 0xB6000000 (2.84 GiB). NEVER use a --full-ram ADT with a kernel without 0173.
+- shim/out/spes-fullram.img (0173, spes-ram25 cmdline, sha256 0f65b13a2cd0...) booted 12:37 local, log research/live-fullram1.txt: no panic, SSH up, MODEM READY, wlfw msa_ready, wlan radio ready, scanout slot used. vm_stat right after boot: ~186k pages of 16 KB in total (= 2.84 GiB), wired 10717-11453 pages. User test pending.
+- CPU is maxed: 4 gold A73 at 2.4 GHz; the A53 silver cores have no 16K granule, so cpus=6/8 still selects 4. Not a lever.
+- Subagent branches (not merged, not built): worktree-agent-a887e5c133bca7808 (bluetoothd loop: exits 0 'No bluetooth on this device', relaunched by clients; tools/spes-disable-bluetoothd.sh), worktree-agent-a7fe2e20c8fe04667 (0176 SPES WWAN QMI probe, wwan=1).
+
 # HANDOFF 2026-11-05 late: iOS on spesn with USB, SSH, Metal UI, Wi-Fi, apt, Sileo installed
 
 Read the entries below for details. State at the end of the session:
