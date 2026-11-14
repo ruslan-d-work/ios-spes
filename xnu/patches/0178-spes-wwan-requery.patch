@@ -1,0 +1,64 @@
+WWAN probe: ask again for the operating mode and the card status on each round (0178).
+
+The first DMS/UIM answers come ~0.5 s after the services appear: operating mode 5, both
+slots ABSENT, and SET_OPERATING_MODE ONLINE answered QMI error 52 (live-k0177va-b2.txt,
+wwan=3, SIM inserted). This asks again every 15 s with the NAS queries and repeats the
+ONLINE request (at most 6 times) while the modem is not online, to tell a modem that is
+still starting from one that stays in that state.
+
+--- a/iokit/Kernel/arm/spes_wwan.inc
++++ b/iokit/Kernel/arm/spes_wwan.inc
+@@ -9,8 +9,11 @@
+  *
+  *   bit 0 (1): query IMEI (TAC only), firmware revision, model, capabilities, operating
+  *              mode, SIM card status, serving system and signal, then repeat the NAS
+- *              queries every 15 s, 8 times.
+- *   bit 1 (2): if the modem is not online, ask DMS once for operating mode ONLINE
++ *              queries every 15 s, 8 times. Each round also asks again for the operating
++ *              mode and the card status (0178): the first answers come ~0.5 s after the
++ *              services appear, when the modem may not have finished starting.
++ *   bit 1 (2): if the modem is not online, ask DMS for operating mode ONLINE, again on
++ *              each round while it is not online, at most 6 times
+  *              (radio on, the modem may register on the network; not persistent).
+  *   bit 2 (4): print the full IMEI (default: the 8-digit TAC, the rest masked).
+  *
+@@ -36,7 +39,8 @@
+ static uint32_t ww_flags;
+ static bool ww_flags_read;
+ static struct { uint32_t node, port, seen_ms; bool up; } ww_dms, ww_nas, ww_uim;
+-static bool ww_dms_asked, ww_uim_asked, ww_online_asked;
++static bool ww_dms_asked, ww_uim_asked;
++static unsigned ww_online_asks;
+ static unsigned ww_nas_rounds, ww_next_nas_ms;
+ static uint16_t ww_txn = 1;
+ 
+@@ -126,6 +130,15 @@
+ 		ww_next_nas_ms = g_ms + 15000;
+ 		wwan_nas(NAS_GET_SERVING);
+ 		wwan_nas(NAS_GET_SIG_INFO);
++		if (ww_nas_rounds > 1) {
++			WWAN_LOG("round %u at t=%u ms", ww_nas_rounds, g_ms);
++			if (ww_dms.up && ww_dms_asked) {
++				wwan_dms(DMS_GET_OPER_MODE);
++			}
++			if (ww_uim.up && ww_uim_asked) {
++				wwan_req(PORT_WWAN_UIM, ww_uim.node, ww_uim.port, UIM_GET_CARD_STATUS, 0, NULL, 0);
++			}
++		}
+ 	}
+ }
+ 
+@@ -206,10 +219,10 @@
+ 				memcpy(&why, w, 2);
+ 			}
+ 			WWAN_LOG("operating mode %u (%s), offline reasons %04x", v[0], ww_opmode(v[0]), why);
+-			if (v[0] != 0 && (ww_flags & 2) && !ww_online_asked) {
++			if (v[0] != 0 && (ww_flags & 2) && ww_online_asks < 6) {
+ 				uint8_t online = 0;
+-				ww_online_asked = true;
+-				WWAN_LOG("asking for operating mode ONLINE");
++				ww_online_asks++;
++				WWAN_LOG("asking for operating mode ONLINE (%u)", ww_online_asks);
+ 				wwan_req(PORT_WWAN_DMS, ww_dms.node, ww_dms.port, DMS_SET_OPER_MODE, 0x01, &online, 1);
+ 			}
+ 		}
