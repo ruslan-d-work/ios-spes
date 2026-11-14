@@ -1,0 +1,603 @@
+GPU: let kept buffers go when the address space is full; log the space and who holds what (0177).
+
+RedwoodGPU keeps up to 160 MB of freed GPU buffers per program (gpu_keep, 60 s), wired and
+mapped in the one 512 MiB GPU address space all programs share, and let them go only when the
+same program made a new buffer. Logs: "MB kept" up to 137 MB for one program (live-sileo1),
+"no addresses left for a buffer of 8912896 bytes" (51 in live-sileo1, 123 in live-gpucache1),
+then "texture refused: texture: OutOfMemory(Device)" in com.apple.WebKit.GPU.
+
+- gpu_reclaim=1 (default): a buffer that finds no run (or no slot) lets kept buffers of all
+  programs go (those at least as big first, oldest first) and tries again; kept buffers older
+  than 60 s are let go in every program each 5 s stats period. gpu_reclaim=0: as before.
+- gpu_keep_mb=N (default 0 = off): at most N MB kept by all programs together.
+- spesgpu_va_mb=N (default 512, at most 960): the space continues into L2 entries 0-223 of
+  the second GiB (0x40000000-0x5bffffff, below the FB table at 0x5c000000).
+- spesgpu_va_fit=1 (default 0): best fit instead of first fit.
+- Log: "RedwoodGPU: space: ..." every stats period (the old gpu_va line never printed: nothing
+  sets gpu_va on spes), "RedwoodGPU: client PID NAME: own/surfaces/host/kept/left ..." every
+  30 s and after a refusal, "RedwoodGPU: reclaim for N bytes ..." on each reclaim (rate-limited).
+  The backend ready line names the VA range and the fit.
+
+--- a/bsd/dev/spes_gpu_backend.h
++++ b/bsd/dev/spes_gpu_backend.h
+@@ -8,18 +8,27 @@
+ /* 512 MiB, L2 entries 256-511 of the first GiB: 256 MiB ran out of runs for 13.9 MB screen
+  * surfaces once the faster CPU kept more of them alive (all11: "no addresses left"). */
+ #define SPES_GPU_SIZE 0x20000000ull
++/*
++ * 0177: boot-arg spesgpu_va_mb=N (512 default, at most 960) lets the space run on past 1 GiB into
++ * the second L2 table (l2_high, L1[1]) up to 0x5c000000, where the framebuffer's table (entry 224)
++ * begins: 0x20000000-0x5bffffff is one run, no new tables. sg.size is what is in use.
++ * spesgpu_va_fit=1 gives the smallest free run that fits instead of the first one.
++ */
++#define SPES_GPU_SIZE_MAX 0x3c000000ull
+ #define SPES_GPU_GRANULE 0x10000ull
+-#define SPES_GPU_GRANULES (SPES_GPU_SIZE / SPES_GPU_GRANULE)
+-#define SPES_GPU_TABLES (SPES_GPU_SIZE >> 21)
++#define SPES_GPU_GRANULES (SPES_GPU_SIZE_MAX / SPES_GPU_GRANULE)
++#define SPES_GPU_TABLES (SPES_GPU_SIZE_MAX >> 21)
+ #define SPES_GPU_BUFFERS 2048u
+ static struct {
+- bool ready, faulted, cacheable;
++ bool ready, faulted, cacheable, best_fit;
+  vm_offset_t gpu, smmu, dma;
+  uint32_t context, tail, fence;
+- uint64_t *l2, *tables[SPES_GPU_TABLES];
++ uint64_t size;                     /* of the space in use: SPES_GPU_SIZE unless spesgpu_va_mb */
++ uint64_t *l2, *l2_high, *tables[SPES_GPU_TABLES];
+  uint8_t used[SPES_GPU_GRANULES];
+  struct { uint64_t base, size, span; bool unmapped; } buffers[SPES_GPU_BUFFERS];
+  uint32_t submissions, timed_through;
++ uint32_t refused_va, refused_slots; /* allocations refused since boot: no run long enough / no slot */
+ } sg;
+ uint32_t gpu_va, gpu_log;
+ extern void RedwoodGPUStart(void);
+@@ -58,8 +67,8 @@
+  return false;
+ }
+ static int spes_gpu_owner(uint64_t address, uint64_t size) {
+- if (!size || address < SPES_GPU_BASE || address >= SPES_GPU_BASE + SPES_GPU_SIZE ||
+-     size > SPES_GPU_BASE + SPES_GPU_SIZE - address) return -1;
++ if (!size || address < SPES_GPU_BASE || address >= SPES_GPU_BASE + sg.size ||
++     size > SPES_GPU_BASE + sg.size - address) return -1;
+  for (unsigned i=0;i<SPES_GPU_BUFFERS;++i)
+   if (sg.buffers[i].base && address >= sg.buffers[i].base &&
+       address - sg.buffers[i].base < sg.buffers[i].size &&
+@@ -67,25 +76,41 @@
+  return -1;
+ }
+ uint64_t redwood_gpu_address(uint64_t size) {
+- if (!redwood_gpu_ready() || !size || size > SPES_GPU_SIZE || (size & 4095)) return 0;
++ if (!redwood_gpu_ready() || !size || size > sg.size || (size & 4095)) return 0;
+  uint64_t span=(size+SPES_GPU_GRANULE-1)&~(SPES_GPU_GRANULE-1);
+  unsigned slot=SPES_GPU_BUFFERS;
+  for(unsigned i=0;i<SPES_GPU_BUFFERS;++i) if(!sg.buffers[i].base){slot=i;break;}
+- if(slot==SPES_GPU_BUFFERS)return 0;
+- unsigned needed=(unsigned)(span/SPES_GPU_GRANULE), run=0;
+- for(unsigned i=0;i<SPES_GPU_GRANULES;++i){
++ if(slot==SPES_GPU_BUFFERS){++sg.refused_slots;return 0;}
++ unsigned needed=(unsigned)(span/SPES_GPU_GRANULE), run=0, granules=(unsigned)(sg.size/SPES_GPU_GRANULE);
++ unsigned first=granules, best=granules+1u;
++ for(unsigned i=0;i<granules;++i){
+   run=sg.used[i]?0:run+1;
+-  if(run!=needed)continue;
+-  unsigned first=i+1-needed;
+-  for(unsigned j=first;j<=i;++j)sg.used[j]=1;
+-  sg.buffers[slot].base=SPES_GPU_BASE+first*SPES_GPU_GRANULE;
+-  sg.buffers[slot].size=size;sg.buffers[slot].span=span;sg.buffers[slot].unmapped=true;
+-  return sg.buffers[slot].base;
++  if(!sg.best_fit){
++   if(run==needed){first=i+1-needed;break;}
++   continue;
++  }
++  /* best fit: at the end of every free run (the next granule used, or the end) */
++  if(run && (i+1==granules || sg.used[i+1]) && run>=needed && run<best){
++   best=run;first=i+1-run;
++   if(run==needed)break;
++  }
+  }
+- return 0;
++ if(first==granules){++sg.refused_va;return 0;}
++ for(unsigned j=first;j<first+needed;++j)sg.used[j]=1;
++ sg.buffers[slot].base=SPES_GPU_BASE+first*SPES_GPU_GRANULE;
++ sg.buffers[slot].size=size;sg.buffers[slot].span=span;sg.buffers[slot].unmapped=true;
++ return sg.buffers[slot].base;
++}
++/* 0177: why the last refusals were (RedwoodGPU's log), and how big the space is. */
++void redwood_gpu_refusals(uint32_t *va,uint32_t *slots,uint64_t *size){
++ *va=sg.refused_va;*slots=sg.refused_slots;*size=sg.size;
++}
++static uint64_t *spes_gpu_parent(unsigned index) {
++ /* L2 entries 256-511 of the first GiB, then 0-223 of the second (0x40000000 on) */
++ return index<256u?&sg.l2[256u+index]:&sg.l2_high[index-256u];
+ }
+ static uint64_t *spes_gpu_leaf(uint64_t address, bool create) {
+- if(address<SPES_GPU_BASE || address>=SPES_GPU_BASE+SPES_GPU_SIZE)return NULL;
++ if(address<SPES_GPU_BASE || address>=SPES_GPU_BASE+sg.size)return NULL;
+  unsigned index=(unsigned)((address-SPES_GPU_BASE)>>21);
+  if(!sg.tables[index] && create){
+   vm_offset_t memory=0;
+@@ -96,8 +121,8 @@
+   memset((void *)memory,0,PAGE_SIZE);
+   to_memory(memory,PAGE_SIZE); /* child must be visible before parent */
+   sg.tables[index]=(uint64_t *)memory;
+-  sg.l2[256+index]=physical|3;
+-  to_memory((vm_offset_t)&sg.l2[256+index],8);
++  *spes_gpu_parent(index)=physical|3;
++  to_memory((vm_offset_t)spes_gpu_parent(index),8);
+  }
+  return sg.tables[index]?&sg.tables[index][(address>>12)&511]:NULL;
+ }
+@@ -157,7 +182,7 @@
+  memset(&sg.buffers[owner],0,sizeof(sg.buffers[owner]));
+ }
+ void redwood_gpu_to_memory(void *start,uint64_t size) {
+- if(size && (!start || size>SPES_GPU_SIZE || (uintptr_t)start+size<(uintptr_t)start))return;
++ if(size && (!start || size>SPES_GPU_SIZE_MAX || (uintptr_t)start+size<(uintptr_t)start))return;
+  to_memory((vm_offset_t)start,(vm_size_t)size);
+ }
+ /* Into the ring behind what is there, if there is room: rptr chases tail. */
+@@ -320,9 +345,9 @@
+ }
+ void redwood_gpu_space(uint64_t *used,uint32_t *live,uint64_t *largest,unsigned *holes,
+     unsigned *most,uint64_t *lost,uint32_t *refused){
+- *used=0;*live=0;*largest=0;*holes=0;*lost=0;*refused=0;
++ *used=0;*live=0;*largest=0;*holes=0;*lost=0;*refused=sg.refused_va+sg.refused_slots;
+  uint64_t run=0;
+- for(unsigned i=0;i<SPES_GPU_GRANULES;++i){
++ for(unsigned i=0;i<(unsigned)(sg.size/SPES_GPU_GRANULE);++i){
+   if(sg.used[i]){*used+=SPES_GPU_GRANULE;run=0;}
+   else{if(!run)++*holes;run+=SPES_GPU_GRANULE;if(run>*largest)*largest=run;}
+  }
+@@ -379,10 +404,24 @@
+  }
+ }
+ static bool spes_gpu_backend_start(vm_offset_t gpu,vm_offset_t smmu,uint32_t context,
+-    vm_offset_t dma,uint64_t *l2,uint32_t tail){
++    vm_offset_t dma,uint64_t *l2,uint64_t *l2_high,uint32_t tail){
+  if(sg.ready || sg.faulted)return false;
+- for(unsigned i=256;i<256+SPES_GPU_TABLES;++i)if(l2[i])return false;
+- sg.gpu=gpu;sg.smmu=smmu;sg.context=context;sg.dma=dma;sg.l2=l2;sg.tail=tail;
++ uint32_t va_mb=(uint32_t)(SPES_GPU_SIZE>>20),fit=0;
++ (void)PE_parse_boot_argn("spesgpu_va_mb",&va_mb,sizeof(va_mb));
++ (void)PE_parse_boot_argn("spesgpu_va_fit",&fit,sizeof(fit));
++ if(va_mb<(uint32_t)(SPES_GPU_SIZE>>20) || va_mb>(uint32_t)(SPES_GPU_SIZE_MAX>>20) || !l2_high)
++  va_mb=(uint32_t)(SPES_GPU_SIZE>>20);
++ sg.size=((uint64_t)va_mb<<20)&~((1ull<<21)-1);  /* whole L2 entries */
++ sg.l2=l2;sg.l2_high=l2_high;
++ for(unsigned i=0;i<(unsigned)(SPES_GPU_SIZE>>21);++i)if(*spes_gpu_parent(i))return false;
++ for(unsigned i=(unsigned)(SPES_GPU_SIZE>>21);i<(unsigned)(sg.size>>21);++i)
++  if(*spes_gpu_parent(i)){ /* somebody else's table there: stay at 512 MiB */
++   printf("SPES GPU: spesgpu_va_mb=%u: L2 entry for %#llx is taken, staying at %llu MiB\n",va_mb,
++       SPES_GPU_BASE+((uint64_t)i<<21),SPES_GPU_SIZE>>20);
++   sg.size=SPES_GPU_SIZE;break;
++  }
++ sg.best_fit=fit!=0;
++ sg.gpu=gpu;sg.smmu=smmu;sg.context=context;sg.dma=dma;sg.tail=tail;
+  sg.fence=((volatile uint32_t *)(dma+0xc000))[9];
+  sg.timed_through=sg.fence;
+  /* GPU cycle counter for the submission times (as msm a6xx_hw_init: RBBM_PERFCTR_CNTL = 1). */
+@@ -401,7 +440,8 @@
+  sg.cacheable=cached!=0;
+  sg.ready=true;
+  RedwoodGPUStart();
+- printf("SPES GPU: persistent backend ready; queued submissions, %llu MiB VA, buffer PTEs %s\n",
+-     SPES_GPU_SIZE >> 20, sg.cacheable ? "cacheable" : "non-cacheable");
++ printf("SPES GPU: persistent backend ready; queued submissions, %llu MiB VA (%#llx-%#llx, %s fit), buffer PTEs %s\n",
++     sg.size >> 20, SPES_GPU_BASE, SPES_GPU_BASE + sg.size - 1, sg.best_fit ? "best" : "first",
++     sg.cacheable ? "cacheable" : "non-cacheable");
+  return true;
+ }
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -2415,7 +2415,7 @@
+ 		passed = ok && released && reused && cleaned;
+ 	}
+ 	if (combined == 1 && passed &&
+-	    spes_gpu_backend_start(gpu, smmu, context, gpu_dma_va, l2, w)) return;
++	    spes_gpu_backend_start(gpu, smmu, context, gpu_dma_va, l2, l2_high, w)) return;
+ 	touch_wr(gpu, 0x2020u, 3u);
+ }
+ 
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -46,6 +46,7 @@
+ #include <mach/mach_time.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
+ 
+ #include "SweetSurface.h"
+ 
+@@ -60,6 +61,7 @@
+ void redwood_gpu_space(uint64_t * used, uint32_t * live, uint64_t * largest, unsigned * holes, unsigned * most,
+     uint64_t * lost, uint32_t * refused);
+ extern uint32_t gpu_va;                 /* boot-arg gpu_va: 0 as before, 1 describe the addresses, 2 also guard them */
++void redwood_gpu_refusals(uint32_t * va, uint32_t * slots, uint64_t * size);    /* 0177 */
+ bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+ bool redwood_gpu_mapped(void);
+ bool redwood_gpu_unmap(uint64_t address, uint64_t size);
+@@ -530,6 +532,33 @@
+ #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
+ 
++/*
++ * 0177. The buffers kept above are wired memory and hold their place in the one GPU address space
++ * that every program shares (512 MiB), up to GPU_KEPT_BYTES for each program, and they were let go
++ * only when the same program asked for a new buffer: a program that stops making buffers (in the
++ * background) kept them until it closed. live-sileo1/gpucache1: "MB kept" up to 137 MB for one
++ * program, and "no addresses left for a buffer of 8912896 bytes" while they were kept, followed
++ * by "texture refused: texture: OutOfMemory(Device)" in WebKit's GPU process.
++ *
++ * gpu_reclaim=1 (default): when the space has no room (or no slot) for a buffer, kept ones of every
++ * program are let go, those at least as big first, the one kept longest first, until it fits; and
++ * every stats period (5 s) kept ones older than GPU_KEPT_SECONDS are let go in every program, not
++ * only in one that asks. Both only let go of what would have been let go later. gpu_reclaim=0: as
++ * before 0177. gpu_keep_mb=N: at most N MB kept by all programs together (0: no such limit).
++ * Log: "RedwoodGPU: space:" every stats period, "RedwoodGPU: client" every 30 s and after a
++ * refusal, "RedwoodGPU: reclaim for" when a buffer found no room.
++ */
++static TUNABLE(uint32_t, gGPUReclaim, "gpu_reclaim", 1);
++static TUNABLE(uint32_t, gGPUKeepMB, "gpu_keep_mb", 0);
++#define GPU_CLIENTS             32
++static uint64_t gGPUKeptAll;                    /* bytes kept by all programs */
++static uint32_t gGPUKeptAllCount;
++static struct {
++	uint32_t aged, capped, reclaimed, reclaimFailed;
++	uint64_t agedBytes, cappedBytes, reclaimedBytes;
++} gGPUKeepStat;                                 /* since the last "space:" line */
++static uint32_t gGPUSpacePeriods, gGPURefusedSeen;
++
+ class RedwoodGPUUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(RedwoodGPUUserClient);
+@@ -546,6 +575,9 @@
+ 	uint32_t                fLeftCount;
+ 	struct gpu_kept         fKept[GPU_KEPT];
+ 	uint64_t                fKeptBytes;
++	int                     fPid;                   /* 0177: whose, for the log */
++	char                    fName[24];
++	bool                    fListed;                /* in gGPUClients */
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+ 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
+@@ -553,6 +585,11 @@
+ 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
+ 	void dropKept(struct gpu_kept * k);
+ 	void reap(void);
++	static struct gpu_kept * oldestKept(RedwoodGPUUserClient ** whose, uint64_t atLeast);
++	static uint64_t reclaimFor(uint64_t size, RedwoodGPUUserClient * asking);
++	static void ageKept(uint64_t now);
++	static void describeAll(bool clients);
++	void unlist(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
+ 	IOReturn hostBuffer(struct redwood_userptr * request);
+@@ -572,6 +609,8 @@
+ 
+ OSDefineMetaClassAndStructors(RedwoodGPUUserClient, IOUserClient);
+ 
++static RedwoodGPUUserClient * gGPUClients[GPU_CLIENTS];       /* with gGPULock held */
++
+ bool
+ RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
+ {
+@@ -579,6 +618,8 @@
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	fPid = proc_selfpid();                  /* (opened from the program's own thread) */
++	proc_selfname(fName, sizeof(fName));
+ 	return true;
+ }
+ 
+@@ -589,7 +630,182 @@
+ 		return false;
+ 	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
+-	return fBuffers != NULL;
++	if (fBuffers == NULL) {
++		return false;
++	}
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_CLIENTS && !fListed; i++) {
++		if (gGPUClients[i] == NULL) {
++			gGPUClients[i] = this;
++			fListed = true;
++		}
++	}
++	IOLockUnlock(gGPULock);
++	return true;
++}
++
++/* With the lock held: out of gGPUClients (its kept ones are nobody else's to let go any more). */
++void
++RedwoodGPUUserClient::unlist(void)
++{
++	for (uint32_t i = 0; fListed && i < GPU_CLIENTS; i++) {
++		if (gGPUClients[i] == this) {
++			gGPUClients[i] = NULL;
++			fListed = false;
++		}
++	}
++}
++
++/* With the lock held: the buffer kept longest by any program, of `atLeast` bytes or more. */
++struct gpu_kept *
++RedwoodGPUUserClient::oldestKept(RedwoodGPUUserClient ** whose, uint64_t atLeast)
++{
++	struct gpu_kept * oldest = NULL;
++
++	*whose = NULL;
++	for (uint32_t c = 0; c < GPU_CLIENTS; c++) {
++		RedwoodGPUUserClient * client = gGPUClients[c];
++
++		for (uint32_t i = 0; client != NULL && i < GPU_KEPT; i++) {
++			struct gpu_kept * k = &client->fKept[i];
++
++			if (k->memory != NULL && k->size >= atLeast && (oldest == NULL || k->since < oldest->since)) {
++				oldest = k;
++				*whose = client;
++			}
++		}
++	}
++	return oldest;
++}
++
++/*
++ * With the lock held, redwood_gpu_address(size) having said no: kept buffers of every program let
++ * go until it says yes (those at least `size` big first: one of them leaves a run that fits).
++ * Returns the address, or 0.
++ */
++uint64_t
++RedwoodGPUUserClient::reclaimFor(uint64_t size, RedwoodGPUUserClient * asking)
++{
++	uint64_t address = 0, bytes = 0, used, largest, lost, space;
++	uint32_t dropped = 0, live, refused, va, slots;
++	unsigned holes, most;
++	static uint32_t said;
++
++	for (uint64_t atLeast = size;; atLeast = 0) {
++		RedwoodGPUUserClient * whose;
++		struct gpu_kept * k;
++		bool stuck = false;
++
++		while (address == 0 && redwood_gpu_ready() && (k = oldestKept(&whose, atLeast)) != NULL) {
++			uint64_t was = k->size;
++
++			whose->dropKept(k);
++			if (k->memory != NULL) {
++				stuck = true;           /* (not unmapped: the GPU is in trouble) */
++				break;
++			}
++			dropped++;
++			bytes += was;
++			address = redwood_gpu_address(size);
++		}
++		if (address != 0 || atLeast == 0 || stuck || !redwood_gpu_ready()) {
++			break;
++		}
++	}
++	if (address != 0) {
++		gGPUKeepStat.reclaimed += dropped;
++		gGPUKeepStat.reclaimedBytes += bytes;
++	} else {
++		gGPUKeepStat.reclaimFailed++;
++	}
++	if (said < 32 || (said & 63) == 0) {
++		redwood_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
++		redwood_gpu_refusals(&va, &slots, &space);
++		IOLog("RedwoodGPU: reclaim for %llu bytes (%d %s): %u kept let go (%llu MB): %s; now %llu of %llu MB used, "
++		    "%u of %u buffers, longest free %llu MB, %u holes, refused %u+%u\n", size, asking->fPid, asking->fName,
++		    dropped, bytes >> 20, address != 0 ? "fits" : "still no room", used >> 20, space >> 20, live, 2048u,
++		    largest >> 20, holes, va, slots);
++	}
++	said++;
++	return address;
++}
++
++/* With the lock held: kept ones older than GPU_KEPT_SECONDS let go in every program. */
++void
++RedwoodGPUUserClient::ageKept(uint64_t now)
++{
++	uint64_t old;
++
++	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
++	for (uint32_t c = 0; c < GPU_CLIENTS; c++) {
++		RedwoodGPUUserClient * client = gGPUClients[c];
++
++		for (uint32_t i = 0; client != NULL && i < GPU_KEPT && redwood_gpu_ready(); i++) {
++			struct gpu_kept * k = &client->fKept[i];
++			uint64_t was = k->size;
++
++			if (k->memory != NULL && now - k->since > old) {
++				client->dropKept(k);
++				if (k->memory == NULL) {
++					gGPUKeepStat.aged++;
++					gGPUKeepStat.agedBytes += was;
++				}
++			}
++		}
++	}
++}
++
++/* With the lock held: what the space holds, and (`clients`) which program holds what. */
++void
++RedwoodGPUUserClient::describeAll(bool clients)
++{
++	uint64_t used, largest, lost, space;
++	uint32_t live, refused, va, slots;
++	unsigned holes, most;
++
++	redwood_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
++	redwood_gpu_refusals(&va, &slots, &space);
++	IOLog("RedwoodGPU: space: %llu of %llu MB used, %u of %u buffers, longest free %llu MB, %u holes, refused %u+%u; "
++	    "kept %llu MB in %u (cap %u MB); let go %u aged %llu MB, %u capped %llu MB, %u for room %llu MB, %u no room\n",
++	    used >> 20, space >> 20, live, 2048u, largest >> 20, holes, va, slots, gGPUKeptAll >> 20, gGPUKeptAllCount,
++	    gGPUKeepMB, gGPUKeepStat.aged, gGPUKeepStat.agedBytes >> 20, gGPUKeepStat.capped, gGPUKeepStat.cappedBytes >> 20,
++	    gGPUKeepStat.reclaimed, gGPUKeepStat.reclaimedBytes >> 20, gGPUKeepStat.reclaimFailed);
++	for (uint32_t c = 0; clients && c < GPU_CLIENTS; c++) {
++		RedwoodGPUUserClient * client = gGPUClients[c];
++		uint64_t own = 0, surfaces = 0, host = 0, left = 0;
++		uint32_t nOwn = 0, nSurfaces = 0, nHost = 0, nKept = 0;
++
++		if (client == NULL || client->fBuffers == NULL) {
++			continue;
++		}
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			struct gpu_buffer * b = &client->fBuffers[i];
++
++			if (b->memory == NULL) {
++				continue;
++			}
++			if (b->surface != NULL) {
++				nSurfaces++;
++				surfaces += b->size;
++			} else if (b->host) {
++				nHost++;
++				host += b->size;
++			} else {
++				nOwn++;
++				own += b->size;
++			}
++		}
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			nKept += client->fKept[i].memory != NULL;
++		}
++		for (uint32_t i = 0; i < client->fLeftCount; i++) {
++			left += client->fLeft[i].size;
++		}
++		IOLog("RedwoodGPU: client %d %s: own %u %llu MB, surfaces %u %llu MB, host %u %llu MB, kept %u %llu MB, "
++		    "left %u %llu MB\n", client->fPid, client->fName, nOwn, own >> 20, nSurfaces, surfaces >> 20, nHost,
++		    host >> 20, nKept, client->fKeptBytes >> 20, client->fLeftCount, left >> 20);
++	}
++	bzero(&gGPUKeepStat, sizeof(gGPUKeepStat));
+ }
+ 
+ /*
+@@ -699,6 +915,7 @@
+ 		for (uint32_t i = 0; i < GPU_KEPT; i++) {
+ 			dropKept(&fKept[i]);
+ 		}
++		unlist();
+ 		if (fLeftCount != 0) {
+ 			IOLog("RedwoodGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
+ 		}
+@@ -713,6 +930,11 @@
+ void
+ RedwoodGPUUserClient::free(void)
+ {
++	if (fListed && gGPULock != NULL) {
++		IOLockLock(gGPULock);
++		unlist();
++		IOLockUnlock(gGPULock);
++	}
+ 	if (fBuffers != NULL) {
+ 		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
+ 		fBuffers = NULL;
+@@ -753,7 +975,10 @@
+ 			break;
+ 		}
+ 	}
+-	if (b == NULL || (b->address = redwood_gpu_address(size)) == 0) {
++	if (b != NULL && (b->address = redwood_gpu_address(size)) == 0 && gGPUReclaim) {
++		b->address = reclaimFor(size, this);
++	}
++	if (b == NULL || b->address == 0) {
+ 		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+ 		return NULL;
+ 	}
+@@ -801,6 +1026,8 @@
+ 	k->memory->release();
+ 	k->memory = NULL;
+ 	fKeptBytes -= k->size;
++	gGPUKeptAll -= k->size;
++	gGPUKeptAllCount--;
+ }
+ 
+ /* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
+@@ -824,9 +1051,26 @@
+ 				oldest = &fKept[i];
+ 			}
+ 		}
+-		if (place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES) {
++		bool mine = place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES;
++		uint64_t cap = (uint64_t) gGPUKeepMB << 20;
++
++		if (mine && (cap == 0 || gGPUKeptAll + size <= cap)) {
+ 			break;
+ 		}
++		if (mine) {
++			/* over gpu_keep_mb for all programs together: the one kept longest anywhere makes way */
++			RedwoodGPUUserClient * whose;
++			struct gpu_kept * k = size <= cap ? oldestKept(&whose, 0) : NULL;
++			uint64_t was;
++
++			if (k == NULL) return false;
++			was = k->size;
++			whose->dropKept(k);
++			if (!redwood_gpu_ready() || k->memory != NULL) return false;
++			gGPUKeepStat.capped++;
++			gGPUKeepStat.cappedBytes += was;
++			continue;
++		}
+ 		if (oldest == NULL) return false;
+ 		dropKept(oldest);
+ 		if (!redwood_gpu_ready() || oldest->memory != NULL) return false;
+@@ -838,6 +1082,8 @@
+ 	place->flags = flags;
+ 	place->since = mach_absolute_time();
+ 	fKeptBytes += size;
++	gGPUKeptAll += size;
++	gGPUKeptAllCount++;
+ 	return true;
+ }
+ 
+@@ -885,6 +1131,8 @@
+ 			request->handle = h + 1;
+ 			found->memory = NULL;
+ 			fKeptBytes -= size;
++			gGPUKeptAll -= size;
++			gGPUKeptAllCount--;
+ 			gGPUStat.given_again++;
+ 			IOLockUnlock(gGPULock);
+ 			if (gGPUKeep == 2) {
+@@ -1286,21 +1534,23 @@
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+ 		    fBufferBytes >> 20);
+-		if (gpu_va != 0) {
+-			/*
+-			 * The address space itself, because nothing else said anything about it: what
+-			 * argument buffers and heaps are built on is that this allocator holds, and
+-			 * "lost" and "refused" are the two ways it stops holding (bsd/dev/
+-			 * redwood_adreno.c, redwood_gpu_address_free).
+-			 */
+-			uint64_t used, largest, lost;
+-			uint32_t live, refused;
+-			unsigned holes, most;
+-
+-			redwood_gpu_space(&used, &live, &largest, &holes, &most, &lost, &refused);
+-			IOLog("RedwoodGPU: addresses: %llu MB in %u buffers, longest run free %llu MB, %u holes "
+-			    "(%u at most, of 1024), %llu KB lost, %u allocations refused\n", used >> 20, live,
+-			    largest >> 20, holes, most, lost >> 10, refused);
++		/*
++		 * 0177: the address space and what is kept, always (the gpu_va line here before was never
++		 * printed on spes: nothing sets gpu_va); which program holds what every 30 s, and after a
++		 * period in which an allocation was refused.
++		 */
++		{
++			uint64_t space;
++			uint32_t va, slots;
++			bool clients;
++
++			if (gGPUReclaim) {
++				ageKept(mach_absolute_time());
++			}
++			redwood_gpu_refusals(&va, &slots, &space);
++			clients = (gGPUSpacePeriods++ % 6) == 0 || va + slots != gGPURefusedSeen;
++			gGPURefusedSeen = va + slots;
++			describeAll(clients);
+ 		}
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
