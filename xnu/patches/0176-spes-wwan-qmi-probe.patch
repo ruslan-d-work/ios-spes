@@ -1,0 +1,474 @@
+SpesModem: opt-in read-only cellular probe over QMI (boot-arg wwan, default off).
+
+The modem (MPSS.HA.1.1.c1) boots and announces 44 QRTR services, among them DMS 2, NAS 3,
+UIM 0x0b, WMS 5, VOICE 9 and WDS 1 (research/live-ram25.txt), but nothing ever talks to them.
+This adds a QMI client for DMS, NAS and UIM, the way qmicli does over AF_QIPCRTR (each QRTR
+client port is its own QMI client), from new ports 0x4005-0x4007, and logs the answers with
+the prefix "SPES WWAN:":
+
+  wwan=1  IMEI (8-digit TAC, rest masked), firmware revision, model, capabilities, operating
+          mode, UIM card status (per slot: card state, apps, PIN state), NAS serving system
+          (registration, PLMN) and signal info; the NAS pair is repeated every 15 s, 8 times.
+  wwan=3  as 1, and if the modem is not ONLINE ask DMS once for ONLINE (radio on, it may then
+          register on the network; DMS online mode is not persistent).
+  wwan=5/7  as 1/3 with the full IMEI.
+
+Without the boot-arg nothing changes except the names of more services in the existing
+"service x:y port z" lines. EFS stays read-only: rmtfs writes are still dropped.
+Parsers host-tested with synthetic and truncated replies (ASan/UBSan clean); not built on CI,
+not booted.
+
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -434,6 +434,9 @@
+ static void svc_announce(void);
+ static void svc_summary(void);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
++static void wwan_server(uint32_t svc, uint32_t node, uint32_t port);
++static void wwan_poll(void);
++static bool wwan_rx(uint32_t dst_port, const uint8_t *d, uint32_t len);
+ static bool wifi_enabled(void);
+ static bool ce_start(void);
+ static void radio_poll(unsigned ms);
+@@ -737,6 +740,22 @@
+ 	case 0x03: return "nas";
+ 	case 0x0B: return "uim";
+ 	case 0x1A: return "wda";
++	case 0x04: return "qos";
++	case 0x05: return "wms";
++	case 0x09: return "voice";
++	case 0x0A: return "cat";
++	case 0x0C: return "pbm";
++	case 0x10: return "loc";
++	case 0x11: return "sar";
++	case 0x12: return "ims";
++	case 0x16: return "time";
++	case 0x17: return "ts";
++	case 0x18: return "tmd";
++	case 0x1D: return "csvt";
++	case 0x21: return "imsa";
++	case 0x22: return "coex";
++	case 0x24: return "pdc";
++	case 0x2A: return "dsd";
+ 	default:   return "";
+ 	}
+ }
+@@ -785,6 +804,7 @@
+ 			wlfw_arrive(c->c, c->d);
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
++			wwan_server(c->a, c->c, c->d);
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+@@ -2953,6 +2973,8 @@
+ 	qm_send(&m, PORT_RMTFS, node, port);
+ }
+ 
++#include "spes_wwan.inc"
++
+ /* ---------------------------------------------------------------- WLFW (QMI 0x45) */
+ 
+ /*
+@@ -5882,6 +5904,7 @@
+ radio_poll(unsigned ms)
+ {
+ 	(void)ms;
++	wwan_poll();
+ 	if (w_cap_retry_ms != 0 && g_ms >= w_cap_retry_ms) {
+ 		w_cap_retry_ms = 0;
+ 		w_simple(WLFW_CAP, "cap sent again");
+@@ -5948,6 +5971,9 @@
+ 		wlfw_rx(data, len);
+ 		return true;
+ 	}
++	if (wwan_rx(dst_port, data, len)) {
++		return true;
++	}
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
+--- /dev/null
++++ b/iokit/Kernel/arm/spes_wwan.inc
+@@ -0,0 +1,381 @@
++/* ---------------------------------------------------------------- WWAN probe (QMI DMS/NAS/UIM) */
++
++/*
++ * Included by SpesModem.cpp after the QMI helpers. A read-only cellular probe: with the
++ * boot-arg wwan=N (default 0, off) it acts as a QMI client of the modem's DMS (2), NAS (3)
++ * and UIM (0x0b) services over our QRTR link, the way libqmi/qmicli does over Linux
++ * AF_QIPCRTR (on QRTR each client port is its own QMI client, no CTL client ids), and logs
++ * the answers with the prefix "SPES WWAN:".
++ *
++ *   bit 0 (1): query IMEI (TAC only), firmware revision, model, capabilities, operating
++ *              mode, SIM card status, serving system and signal, then repeat the NAS
++ *              queries every 15 s, 8 times.
++ *   bit 1 (2): if the modem is not online, ask DMS once for operating mode ONLINE
++ *              (radio on, the modem may register on the network; not persistent).
++ *   bit 2 (4): print the full IMEI (default: the 8-digit TAC, the rest masked).
++ *
++ * Nothing is written to NV/EFS: rmtfs writes are still discarded (see rmtfs_rx).
++ */
++#define PORT_WWAN_DMS       0x4005
++#define PORT_WWAN_NAS       0x4006
++#define PORT_WWAN_UIM       0x4007
++#define QMI_SVC_DMS         0x02
++#define QMI_SVC_NAS         0x03
++#define QMI_SVC_UIM         0x0B
++#define DMS_GET_CAPS        0x0020
++#define DMS_GET_MODEL       0x0022
++#define DMS_GET_REVISION    0x0023
++#define DMS_GET_IDS         0x0025
++#define DMS_GET_OPER_MODE   0x002D
++#define DMS_SET_OPER_MODE   0x002E
++#define NAS_GET_SERVING     0x0024
++#define NAS_GET_SIG_INFO    0x004F
++#define UIM_GET_CARD_STATUS 0x002F
++#define WWAN_LOG(fmt, ...)  IOLog("SPES WWAN: " fmt "\n", ##__VA_ARGS__)
++
++static uint32_t ww_flags;
++static bool ww_flags_read;
++static struct { uint32_t node, port, seen_ms; bool up; } ww_dms, ww_nas, ww_uim;
++static bool ww_dms_asked, ww_uim_asked, ww_online_asked;
++static unsigned ww_nas_rounds, ww_next_nas_ms;
++static uint16_t ww_txn = 1;
++
++static uint32_t
++wwan_flags(void)
++{
++	if (!ww_flags_read) {
++		ww_flags_read = true;
++		if (!PE_parse_boot_argn("wwan", &ww_flags, sizeof(ww_flags))) {
++			ww_flags = 0;
++		}
++		if (ww_flags != 0) {
++			WWAN_LOG("probe on (wwan=%u)%s", ww_flags, (ww_flags & 2) ? ", will ask for ONLINE" : "");
++		}
++	}
++	return ww_flags;
++}
++
++/* from qrtr_rx: NEW_SERVER */
++static void
++wwan_server(uint32_t svc, uint32_t node, uint32_t port)
++{
++	if (wwan_flags() == 0) {
++		return;
++	}
++	if (svc == QMI_SVC_DMS) {
++		ww_dms.node = node; ww_dms.port = port; ww_dms.seen_ms = g_ms; ww_dms.up = true;
++		ww_dms_asked = false;
++	} else if (svc == QMI_SVC_NAS) {
++		ww_nas.node = node; ww_nas.port = port; ww_nas.seen_ms = g_ms; ww_nas.up = true;
++		ww_nas_rounds = 0;
++		ww_next_nas_ms = g_ms + 1000;
++	} else if (svc == QMI_SVC_UIM) {
++		ww_uim.node = node; ww_uim.port = port; ww_uim.seen_ms = g_ms; ww_uim.up = true;
++		ww_uim_asked = false;
++	} else {
++		return;
++	}
++	WWAN_LOG("t=%u ms: service %x up on node %u port %x", g_ms, svc, node, port);
++}
++
++/* a request with optional single TLV, from our client port for that service */
++static void
++wwan_req(uint32_t src_port, uint32_t node, uint32_t port, uint16_t msg, uint8_t tlv, const void *v, uint16_t vlen)
++{
++	uint8_t b[32];
++	uint16_t txn = ww_txn++, l = 0;
++
++	b[0] = QMI_REQ;
++	memcpy(b + 1, &txn, 2);
++	memcpy(b + 3, &msg, 2);
++	if (v != NULL && vlen <= sizeof(b) - 10) {
++		b[7] = tlv;
++		memcpy(b + 8, &vlen, 2);
++		memcpy(b + 10, v, vlen);
++		l = (uint16_t)(3 + vlen);
++	}
++	memcpy(b + 5, &l, 2);
++	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, b, 7u + l);
++}
++
++static void wwan_dms(uint16_t msg) { wwan_req(PORT_WWAN_DMS, ww_dms.node, ww_dms.port, msg, 0, NULL, 0); }
++static void wwan_nas(uint16_t msg) { wwan_req(PORT_WWAN_NAS, ww_nas.node, ww_nas.port, msg, 0, NULL, 0); }
++
++/* from radio_poll, every ms */
++static void
++wwan_poll(void)
++{
++	if (wwan_flags() == 0) {
++		return;
++	}
++	/* let the modem settle 500 ms after the announcement */
++	if (ww_dms.up && !ww_dms_asked && g_ms >= ww_dms.seen_ms + 500) {
++		ww_dms_asked = true;
++		wwan_dms(DMS_GET_IDS);
++		wwan_dms(DMS_GET_REVISION);
++		wwan_dms(DMS_GET_MODEL);
++		wwan_dms(DMS_GET_CAPS);
++		wwan_dms(DMS_GET_OPER_MODE);
++	}
++	if (ww_uim.up && !ww_uim_asked && g_ms >= ww_uim.seen_ms + 500) {
++		ww_uim_asked = true;
++		wwan_req(PORT_WWAN_UIM, ww_uim.node, ww_uim.port, UIM_GET_CARD_STATUS, 0, NULL, 0);
++	}
++	if (ww_nas.up && ww_nas_rounds < 8 && g_ms >= ww_next_nas_ms) {
++		ww_nas_rounds++;
++		ww_next_nas_ms = g_ms + 15000;
++		wwan_nas(NAS_GET_SERVING);
++		wwan_nas(NAS_GET_SIG_INFO);
++	}
++}
++
++static const char *
++ww_opmode(uint8_t m)
++{
++	static const char *n[] = { "ONLINE", "low power", "factory test", "offline", "resetting",
++		                   "shutting down", "persistent low power", "mode-only low power" };
++	return m < sizeof(n) / sizeof(n[0]) ? n[m] : "?";
++}
++
++static const char *
++ww_radio(uint8_t r)
++{
++	switch (r) {
++	case 0: return "none";
++	case 1: return "cdma1x";
++	case 2: return "evdo";
++	case 3: return "amps";
++	case 4: return "gsm";
++	case 5: return "umts";
++	case 8: return "lte";
++	case 9: return "td-scdma";
++	case 12: return "5gnr";
++	default: return "?";
++	}
++}
++
++static void
++ww_on_dms(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	char s[96];
++	uint16_t l = 0;
++	const uint8_t *v;
++
++	switch (msg) {
++	case DMS_GET_IDS:
++		qm_string(d, len, 0x11, s, sizeof(s));
++		if (strlen(s) > 8 && !(ww_flags & 4)) {
++			for (size_t i = 8; s[i] != 0; i++) {
++				s[i] = '*';
++			}
++		}
++		WWAN_LOG("IMEI %s", s[0] != 0 ? s : "(none)");
++		qm_string(d, len, 0x13, s, sizeof(s));
++		if (s[0] != 0) {
++			WWAN_LOG("IMEI SV %s", s);
++		}
++		break;
++	case DMS_GET_REVISION:
++		qm_string(d, len, 0x01, s, sizeof(s));
++		WWAN_LOG("firmware revision %s", s);
++		break;
++	case DMS_GET_MODEL:
++		qm_string(d, len, 0x01, s, sizeof(s));
++		WWAN_LOG("model %s", s);
++		break;
++	case DMS_GET_CAPS:
++		v = qm_find(d, len, 0x01, &l);
++		if (v != NULL && l >= 11) {
++			uint32_t tx, rx;
++			char r[64] = "";
++			memcpy(&tx, v, 4);
++			memcpy(&rx, v + 4, 4);
++			for (unsigned i = 0; i < v[10] && 11u + i < l; i++) {
++				strlcat(r, " ", sizeof(r));
++				strlcat(r, ww_radio(v[11 + i]), sizeof(r));
++			}
++			WWAN_LOG("caps: max tx %u rx %u bps, data %u, sim %u, radios:%s", tx, rx, v[8], v[9], r);
++		}
++		break;
++	case DMS_GET_OPER_MODE:
++		v = qm_find(d, len, 0x01, &l);
++		if (v != NULL && l >= 1) {
++			uint16_t why = 0, wl = 0;
++			const uint8_t *w = qm_find(d, len, 0x10, &wl);
++			if (w != NULL && wl >= 2) {
++				memcpy(&why, w, 2);
++			}
++			WWAN_LOG("operating mode %u (%s), offline reasons %04x", v[0], ww_opmode(v[0]), why);
++			if (v[0] != 0 && (ww_flags & 2) && !ww_online_asked) {
++				uint8_t online = 0;
++				ww_online_asked = true;
++				WWAN_LOG("asking for operating mode ONLINE");
++				wwan_req(PORT_WWAN_DMS, ww_dms.node, ww_dms.port, DMS_SET_OPER_MODE, 0x01, &online, 1);
++			}
++		}
++		break;
++	case DMS_SET_OPER_MODE:
++		WWAN_LOG("set operating mode answered");
++		wwan_dms(DMS_GET_OPER_MODE);
++		ww_next_nas_ms = g_ms + 3000;   /* look at registration soon after */
++		if (ww_nas_rounds >= 8) {
++			ww_nas_rounds = 4;
++		}
++		break;
++	}
++}
++
++static void
++ww_on_nas(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	static const char *reg[] = { "not registered", "REGISTERED", "searching", "denied", "unknown" };
++	uint16_t l = 0;
++	const uint8_t *v;
++
++	if (msg == NAS_GET_SERVING) {
++		v = qm_find(d, len, 0x01, &l);
++		if (v != NULL && l >= 5) {
++			char r[64] = "";
++			for (unsigned i = 0; i < v[4] && 5u + i < l; i++) {
++				strlcat(r, " ", sizeof(r));
++				strlcat(r, ww_radio(v[5 + i]), sizeof(r));
++			}
++			WWAN_LOG("serving: %s, cs attach %u, ps attach %u, network type %u, radio:%s",
++			    v[0] < 5 ? reg[v[0]] : "?", v[1], v[2], v[3], r[0] ? r : " none");
++		}
++		v = qm_find(d, len, 0x12, &l);
++		if (v != NULL && l >= 5) {
++			uint16_t mcc, mnc;
++			char n[40] = "";
++			memcpy(&mcc, v, 2);
++			memcpy(&mnc, v + 2, 2);
++			uint8_t nl = (uint8_t)MIN((unsigned)v[4], MIN((unsigned)l - 5u, (unsigned)sizeof(n) - 1));
++			memcpy(n, v + 5, nl);
++			n[nl] = 0;
++			for (unsigned i = 0; i < nl; i++) {
++				if (n[i] < 0x20 || n[i] > 0x7e) {
++					n[i] = '?';
++				}
++			}
++			WWAN_LOG("network PLMN %03u-%02u '%s'", mcc, mnc, n);
++		}
++	} else if (msg == NAS_GET_SIG_INFO) {
++		bool any = false;
++		v = qm_find(d, len, 0x12, &l);
++		if (v != NULL && l >= 1) {
++			WWAN_LOG("signal gsm: rssi %d dBm", (int8_t)v[0]);
++			any = true;
++		}
++		v = qm_find(d, len, 0x13, &l);
++		if (v != NULL && l >= 3) {
++			int16_t ecio;
++			memcpy(&ecio, v + 1, 2);
++			WWAN_LOG("signal umts: rssi %d dBm, ecio %d (-0.5 dB units)", (int8_t)v[0], ecio);
++			any = true;
++		}
++		v = qm_find(d, len, 0x14, &l);
++		if (v != NULL && l >= 6) {
++			int16_t rsrp, snr;
++			memcpy(&rsrp, v + 2, 2);
++			memcpy(&snr, v + 4, 2);
++			WWAN_LOG("signal lte: rssi %d dBm, rsrq %d dB, rsrp %d dBm, snr %d (0.1 dB)",
++			    (int8_t)v[0], (int8_t)v[1], rsrp, snr);
++			any = true;
++		}
++		v = qm_find(d, len, 0x17, &l);
++		if (v != NULL && l >= 4) {
++			int16_t rsrp, snr;
++			memcpy(&rsrp, v, 2);
++			memcpy(&snr, v + 2, 2);
++			WWAN_LOG("signal 5g: rsrp %d dBm, snr %d (0.1 dB)", rsrp, snr);
++			any = true;
++		}
++		if (!any) {
++			WWAN_LOG("signal: no radio measured");
++		}
++	}
++}
++
++/*
++ * UIM Get Card Status, TLV 0x10 (libqmi uim.json): 4 x u16 session indexes, u8 card count,
++ * per card: state, upin state, upin retries, upuk retries, error code, u8 app count, per app:
++ * type, state, perso state, perso feature, perso retries, perso unblock retries, u8 aid
++ * length + aid, upin replaces pin1, pin1 state, pin1 retries, puk1 retries, pin2 state,
++ * pin2 retries, puk2 retries.
++ */
++static void
++ww_on_uim(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	static const char *card[] = { "ABSENT", "PRESENT", "ERROR" };
++	static const char *app[] = { "unknown", "sim", "usim", "ruim", "csim", "isim" };
++	static const char *ast[] = { "unknown", "detected", "PIN1 required", "PUK1 required",
++		                     "checking perso", "PIN1 blocked", "illegal", "READY" };
++	uint16_t l = 0;
++	const uint8_t *v;
++
++	if (msg != UIM_GET_CARD_STATUS) {
++		return;
++	}
++	v = qm_find(d, len, 0x10, &l);
++	if (v == NULL || l < 9) {
++		WWAN_LOG("card status: no status TLV (%u bytes)", len);
++		return;
++	}
++	uint32_t o = 8;
++	unsigned cards = v[o++];
++	WWAN_LOG("card status: %u slot(s)", cards);
++	for (unsigned c = 0; c < cards && o + 6 <= l; c++) {
++		uint8_t st = v[o], err = v[o + 4], apps = v[o + 5];
++		WWAN_LOG("slot %u: card %s (error %u), upin state %u, %u app(s)", c + 1,
++		    st < 3 ? card[st] : "?", err, v[o + 1], apps);
++		o += 6;
++		for (unsigned a = 0; a < apps && o + 7 <= l; a++) {
++			uint8_t type = v[o], state = v[o + 1], perso = v[o + 2], aidl = v[o + 6];
++			if (o + 7 + aidl + 7 > l) {
++				o = l;
++				break;
++			}
++			const uint8_t *p = v + o + 7 + aidl;
++			WWAN_LOG("slot %u app %u: %s %s, perso %u, pin1 state %u (%u tries, puk %u)", c + 1, a + 1,
++			    type < 6 ? app[type] : "?", state < 8 ? ast[state] : "?", perso, p[1], p[2], p[3]);
++			o += 7 + aidl + 7;
++		}
++	}
++}
++
++/* from svc_rx: answers to our client ports */
++static bool
++wwan_rx(uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	uint16_t msg, err = 0xFFFF, res = 0xFFFF, l = 0;
++	const uint8_t *r;
++
++	if (dst_port != PORT_WWAN_DMS && dst_port != PORT_WWAN_NAS && dst_port != PORT_WWAN_UIM) {
++		return false;
++	}
++	if (len < 7) {
++		return true;
++	}
++	memcpy(&msg, d + 3, 2);
++	if (d[0] != QMI_RESP) {
++		return true;                            /* no indications registered */
++	}
++	r = qm_find(d, len, 2, &l);
++	if (r != NULL && l >= 4) {
++		memcpy(&res, r, 2);
++		memcpy(&err, r + 2, 2);
++	}
++	if (res != 0) {
++		WWAN_LOG("%s msg %04x: QMI error %u (result %u)", dst_port == PORT_WWAN_DMS ? "dms" :
++		    dst_port == PORT_WWAN_NAS ? "nas" : "uim", msg, err, res);
++		return true;
++	}
++	if (dst_port == PORT_WWAN_DMS) {
++		ww_on_dms(msg, d, len);
++	} else if (dst_port == PORT_WWAN_NAS) {
++		ww_on_nas(msg, d, len);
++	} else {
++		ww_on_uim(msg, d, len);
++	}
++	return true;
++}
