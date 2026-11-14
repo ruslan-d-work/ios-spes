@@ -1,0 +1,522 @@
+spes: reset to the bootloader, PMIC clock, two SIM slots, lock selector, later modem questions (0179).
+
+1. bsd/dev/spes_pmic.c (new, boot-arg spespmic=1): sysctl debug.spes_reset resets the phone
+   (1), to the bootloader (2) or to the recovery (3), as Linux msm-poweroff + qpnp-power-on do:
+   reason in PON_SOFT_RB_SPARE, restart_reason cookie in IMEM, optional PS_HOLD type (0x10
+   warm, 0x20 hard), PS_HOLD dropped. "reboot" over SSH hangs at "hfs: unmount initiated" and
+   every forced reset costs a fastboot slot retry. sysctl hw.spes_rtc reads the PM6125 RTC
+   counter: the clock starts at 1969 on every boot. PMIC writes: only 0x85a, 0x85b, 0x88f.
+2. WWAN probe: wwan bit 3 (8) activates a GW provisioning session on each slot whose SIM/USIM
+   is only "detected" (first primary, second secondary) and binds a second NAS client to
+   subscription 2. With 0178 the modem went ONLINE by itself and showed a USIM in slot 2 as
+   "detected", serving "searching" (live-k0177va-b2.txt).
+3. WWAN probe: the first round is 10 s after the services appear and every round asks for the
+   operating mode and the card status; the answers at 0.5 s (mode 5, no cards) were not final.
+   16 rounds.
+4. AppleKeyStore selector 8 (SpringBoard, at each lock) answered kIOReturnUnsupported in every
+   boot; it now succeeds like the other lock/unlock selectors. Untested guess for the lock
+   screen that stopped taking the swipe up after display off/on.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/spes_pmic.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- /dev/null
++++ b/bsd/dev/spes_pmic.c
+@@ -0,0 +1,265 @@
++/*
++ * spes (SM6225 + PM6125, SPMI PMIC arbiter v5): the PMIC real-time clock and a reset that
++ * can name the bootloader or the recovery, both through sysctl. Off unless the boot-arg
++ * spespmic=1 is given: the addresses are those of SM6225 (sm6125.dtsi spmi_bus, restart@440b000,
++ * msm-imem@c125000), wrong for sweet.
++ *
++ *   hw.spes_rtc (read only)   PM6125 RTC counter in seconds (0x6048..0x604b). Qualcomm's RTC
++ *                             cannot be set: userland keeps "wall clock - counter" in a file
++ *                             and adds it back at boot.
++ *   debug.spes_reset (write)  low 4 bits: 1 reset, 2 reset to the bootloader (fastboot),
++ *                             3 reset to the recovery. 0x10: first set PS_HOLD to a warm
++ *                             reset, 0x20: to a hard reset (what Linux does on this phone,
++ *                             "qcom,store-hard-reset-reason"); neither: leave the type the
++ *                             bootloader set. Nothing is unmounted or synced: run sync first.
++ *
++ * As Linux msm-poweroff.c + qpnp-power-on.c (gen2 PON): the reason goes into
++ * PON_SOFT_RB_SPARE (0x88f) bits 7:1 and the restart_reason cookie in IMEM, then PS_HOLD
++ * is dropped. PMIC WRITES: only 0x85a, 0x85b and 0x88f of USID 0, on the PON write channel
++ * (the keys driver uses the PON observer channel, which this file never touches). The RTC
++ * is read on its own observer channel.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define PM_CORE_PA      0x01c40000u
++#define PM_CHNLS_PA     0x01e00000u
++#define PM_OBS_PA       0x03e00000u
++#define PM_CNFG_PA      0x01c0a000u
++#define PM_PSHOLD_PA    0x0440b000u
++#define PM_IMEM_PA      0x0c125000u
++#define PM_IMEM_REASON  0x65cu
++#define PM_NO_APID      0xffffu
++
++static vm_offset_t pm_core, pm_obs, pm_cnfg, pm_wr, pm_pshold, pm_imem;
++static uint32_t pm_count;
++static uint16_t pm_wr_apid = PM_NO_APID;
++static int pm_state;                            /* 0 not tried, 1 ready, -1 off or failed */
++
++static uint32_t
++pm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return value;
++}
++
++static void
++pm_wrl(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* v5 can map one PPID twice: the apps (EE 0) own one of them, only that one can be written */
++static uint16_t
++pm_find_apid(uint32_t ppid, bool owned)
++{
++	uint16_t found = PM_NO_APID;
++
++	for (uint32_t i = 0; i < pm_count; ++i) {
++		uint32_t map = pm_rd(pm_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = pm_rd(pm_cnfg, 0x700u + 4u * i) & 7u;
++		if (owner == 0) {
++			return (uint16_t)i;
++		}
++		if (!owned && found == PM_NO_APID) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++pm_init(void)
++{
++	uint32_t on = 0;
++
++	if (pm_state != 0) {
++		return pm_state > 0;
++	}
++	pm_state = -1;
++	if (!PE_parse_boot_argn("spespmic", &on, sizeof(on)) || on == 0) {
++		return false;
++	}
++	pm_core = ml_io_map(PM_CORE_PA, 0x2000);
++	pm_cnfg = ml_io_map(PM_CNFG_PA, 0x1000);
++	pm_obs = ml_io_map(PM_OBS_PA, 0x10000);         /* EE 0: 512 channels of 0x80 */
++	pm_pshold = ml_io_map(PM_PSHOLD_PA, 0x1000);
++	pm_imem = ml_io_map(PM_IMEM_PA, 0x1000);
++	if (!pm_core || !pm_cnfg || !pm_obs || !pm_pshold || !pm_imem) {
++		printf("SPES PMIC: mapping failed\n");
++		return false;
++	}
++	uint32_t arb = pm_rd(pm_core, 0);
++	pm_count = pm_rd(pm_core, 4) & 0x7ffu;
++	if (arb < 0x50000000u || arb >= 0x70000000u || pm_count == 0 || pm_count > 512) {
++		printf("SPES PMIC: unsupported arbiter %#x with %u channels\n", arb, pm_count);
++		return false;
++	}
++	printf("SPES PMIC: arbiter %#x, %u channels\n", arb, pm_count);
++	pm_state = 1;
++	return true;
++}
++
++/* one register through the observer channel of its peripheral (EXT_READL, one byte) */
++static int
++pm_read(uint32_t addr, uint8_t *out)
++{
++	uint16_t apid = pm_find_apid(addr >> 8, false);
++
++	if (apid == PM_NO_APID) {
++		return -1;
++	}
++	uint32_t off = 0x80u * apid;
++	pm_wrl(pm_obs, off, (1u << 27) | ((addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 2000; ++i) {
++		uint32_t status = pm_rd(pm_obs, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return -1;
++			}
++			*out = (uint8_t)pm_rd(pm_obs, off + 0x18u);
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/* one PON register through the write channel the apps own (EXT_WRITEL, one byte) */
++static int
++pm_pon_write(uint32_t addr, uint8_t value)
++{
++	if (addr != 0x85au && addr != 0x85bu && addr != 0x88fu) {
++		return -1;
++	}
++	if (pm_wr_apid == PM_NO_APID) {
++		uint16_t apid = pm_find_apid(0x008u, true);
++		if (apid == PM_NO_APID) {
++			printf("SPES PMIC: the apps own no PON channel\n");
++			return -1;
++		}
++		pm_wr = ml_io_map(PM_CHNLS_PA + 0x10000u * apid, 0x1000);
++		if (!pm_wr) {
++			return -1;
++		}
++		pm_wr_apid = apid;
++	}
++	pm_wrl(pm_wr, 0x10u, value);
++	pm_wrl(pm_wr, 0x00u, (0u << 27) | ((addr & 0xffu) << 4));
++	for (unsigned i = 0; i < 2000; ++i) {
++		uint32_t status = pm_rd(pm_wr, 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				printf("SPES PMIC: write %#x refused, status %#x\n", addr, status);
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	printf("SPES PMIC: write %#x timed out\n", addr);
++	return -1;
++}
++
++static int
++pm_rtc_seconds(uint32_t *out)
++{
++	uint8_t b[4], again;
++
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		for (unsigned i = 0; i < 4; ++i) {
++			if (pm_read(0x6048u + i, &b[i])) {
++				return -1;
++			}
++		}
++		/* the low byte must not have turned over while the others were read */
++		if (pm_read(0x6048u, &again)) {
++			return -1;
++		}
++		if (again == b[0]) {
++			*out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
++			    ((uint32_t)b[3] << 24);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++spes_rtc_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t seconds = 0;
++
++	if (!pm_init() || pm_rtc_seconds(&seconds)) {
++		return ENXIO;
++	}
++	return SYSCTL_OUT(req, &seconds, sizeof(seconds));
++}
++SYSCTL_PROC(_hw, OID_AUTO, spes_rtc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, spes_rtc_sysctl, "IU", "PM6125 RTC counter, seconds");
++
++static int
++spes_reset_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = 0;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	unsigned what = (unsigned)value & 0x0fu, type = (unsigned)value & 0x30u;
++	if (what < 1 || what > 3 || ((unsigned)value & ~0x3fu) != 0 || type == 0x30u) {
++		return EINVAL;
++	}
++	if (!pm_init()) {
++		return ENXIO;
++	}
++	/* qpnp-power-on.c PON_RESTART_REASON_*: recovery 1, bootloader 2; msm-poweroff.c cookies */
++	uint8_t reason = what == 2 ? 0x02 : what == 3 ? 0x01 : 0x00;
++	uint32_t cookie = what == 2 ? 0x77665500u : what == 3 ? 0x77665502u : 0x77665501u;
++
++	printf("SPES PMIC: reset asked: %s, PS_HOLD type %s\n",
++	    what == 2 ? "bootloader" : what == 3 ? "recovery" : "plain",
++	    type == 0x10u ? "warm" : type == 0x20u ? "hard" : "as the bootloader left it");
++	if (pm_pon_write(0x88fu, (uint8_t)(reason << 1))) {
++		return EIO;
++	}
++	if (type != 0) {
++		/* qpnp_pon_system_pwr_off: disable, wait, type, enable */
++		if (pm_pon_write(0x85bu, 0x00)) {
++			return EIO;
++		}
++		delay(1000);
++		if (pm_pon_write(0x85au, type == 0x10u ? 0x01 : 0x07) || pm_pon_write(0x85bu, 0x80)) {
++			return EIO;
++		}
++		delay(1000);
++	}
++	pm_wrl(pm_imem, PM_IMEM_REASON, cookie);
++	printf("SPES PMIC: dropping PS_HOLD\n");
++	delay(200000);                                  /* let the console line out */
++	pm_wrl(pm_pshold, 0, 0);
++	delay(3000000);
++	printf("SPES PMIC: still running 3 s after PS_HOLD was dropped\n");
++	return EIO;
++}
++SYSCTL_PROC(_debug, OID_AUTO, spes_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, spes_reset_sysctl, "I", "spes: reset (1), to the bootloader (2), to the recovery (3)");
++#endif
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -34,6 +34,7 @@
+ 	kAKSSetSystem        = 5,
+ 	kAKSLoadBag          = 6,
+ 	kAKSGetLockState     = 7,
++	kAKSLockDevice       = 8,      /* aks_lock_device: SpringBoard, at each lock */
+ 	kAKSUnlockDevice     = 9,
+ 	kAKSWrapKey          = 10,
+ 	kAKSUnwrapKey        = 11,
+@@ -187,6 +188,7 @@
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
++	case kAKSLockDevice:
+ 	case kAKSUnlockDevice:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
+--- a/iokit/Kernel/arm/spes_wwan.inc
++++ b/iokit/Kernel/arm/spes_wwan.inc
+@@ -9,19 +9,25 @@
+  *
+  *   bit 0 (1): query IMEI (TAC only), firmware revision, model, capabilities, operating
+  *              mode, SIM card status, serving system and signal, then repeat the NAS
+- *              queries every 15 s, 8 times. Each round also asks again for the operating
++ *              queries every 15 s, 16 times. Each round also asks again for the operating
+  *              mode and the card status (0178): the first answers come ~0.5 s after the
+  *              services appear, when the modem may not have finished starting.
+  *   bit 1 (2): if the modem is not online, ask DMS for operating mode ONLINE, again on
+  *              each round while it is not online, at most 6 times
+  *              (radio on, the modem may register on the network; not persistent).
+  *   bit 2 (4): print the full IMEI (default: the 8-digit TAC, the rest masked).
++ *   bit 3 (8): for each slot whose SIM/USIM application is only "detected", ask UIM to
++ *              activate a provisioning session, as Android's RIL does: the first such slot
++ *              becomes the primary GW subscription, the second the secondary one (0179).
++ *              A second NAS client is then bound to subscription 2 and asked each round.
++ *              Not persistent. A PIN is only reported, never entered.
+  *
+  * Nothing is written to NV/EFS: rmtfs writes are still discarded (see rmtfs_rx).
+  */
+ #define PORT_WWAN_DMS       0x4005
+ #define PORT_WWAN_NAS       0x4006
+ #define PORT_WWAN_UIM       0x4007
++#define PORT_WWAN_NAS2      0x4008              /* a second NAS client, bound to subscription 2 */
+ #define QMI_SVC_DMS         0x02
+ #define QMI_SVC_NAS         0x03
+ #define QMI_SVC_UIM         0x0B
+@@ -34,6 +40,9 @@
+ #define NAS_GET_SERVING     0x0024
+ #define NAS_GET_SIG_INFO    0x004F
+ #define UIM_GET_CARD_STATUS 0x002F
++#define UIM_CHANGE_PROV     0x0038
++#define NAS_BIND_SUBS       0x0045
++#define WW_ROUNDS           16
+ #define WWAN_LOG(fmt, ...)  IOLog("SPES WWAN: " fmt "\n", ##__VA_ARGS__)
+ 
+ static uint32_t ww_flags;
+@@ -42,6 +51,8 @@
+ static bool ww_dms_asked, ww_uim_asked;
+ static unsigned ww_online_asks;
+ static unsigned ww_nas_rounds, ww_next_nas_ms;
++static bool ww_prov_asked[2], ww_nas2_bound;
++static unsigned ww_prov_count, ww_uim_again_ms;
+ static uint16_t ww_txn = 1;
+ 
+ static uint32_t
+@@ -72,10 +83,13 @@
+ 	} else if (svc == QMI_SVC_NAS) {
+ 		ww_nas.node = node; ww_nas.port = port; ww_nas.seen_ms = g_ms; ww_nas.up = true;
+ 		ww_nas_rounds = 0;
+-		ww_next_nas_ms = g_ms + 1000;
++		ww_next_nas_ms = g_ms + 10000;          /* the modem needs ~10 s to finish starting */
++		ww_nas2_bound = false;
+ 	} else if (svc == QMI_SVC_UIM) {
+ 		ww_uim.node = node; ww_uim.port = port; ww_uim.seen_ms = g_ms; ww_uim.up = true;
+ 		ww_uim_asked = false;
++		ww_prov_asked[0] = ww_prov_asked[1] = false;
++		ww_prov_count = 0;
+ 	} else {
+ 		return;
+ 	}
+@@ -119,25 +133,28 @@
+ 		wwan_dms(DMS_GET_REVISION);
+ 		wwan_dms(DMS_GET_MODEL);
+ 		wwan_dms(DMS_GET_CAPS);
+-		wwan_dms(DMS_GET_OPER_MODE);
+ 	}
+-	if (ww_uim.up && !ww_uim_asked && g_ms >= ww_uim.seen_ms + 500) {
+-		ww_uim_asked = true;
++	/* 0.5 s after the services appear the modem still says mode 5 and no cards: ask in the rounds */
++	ww_uim_asked = ww_uim.up;
++	if (ww_uim.up && ww_uim_again_ms != 0 && g_ms >= ww_uim_again_ms) {
++		ww_uim_again_ms = 0;
+ 		wwan_req(PORT_WWAN_UIM, ww_uim.node, ww_uim.port, UIM_GET_CARD_STATUS, 0, NULL, 0);
+ 	}
+-	if (ww_nas.up && ww_nas_rounds < 8 && g_ms >= ww_next_nas_ms) {
++	if (ww_nas.up && ww_nas_rounds < WW_ROUNDS && g_ms >= ww_next_nas_ms) {
+ 		ww_nas_rounds++;
+ 		ww_next_nas_ms = g_ms + 15000;
+ 		wwan_nas(NAS_GET_SERVING);
+ 		wwan_nas(NAS_GET_SIG_INFO);
+-		if (ww_nas_rounds > 1) {
+-			WWAN_LOG("round %u at t=%u ms", ww_nas_rounds, g_ms);
+-			if (ww_dms.up && ww_dms_asked) {
+-				wwan_dms(DMS_GET_OPER_MODE);
+-			}
+-			if (ww_uim.up && ww_uim_asked) {
+-				wwan_req(PORT_WWAN_UIM, ww_uim.node, ww_uim.port, UIM_GET_CARD_STATUS, 0, NULL, 0);
+-			}
++		WWAN_LOG("round %u at t=%u ms", ww_nas_rounds, g_ms);
++		if (ww_nas2_bound) {
++			wwan_req(PORT_WWAN_NAS2, ww_nas.node, ww_nas.port, NAS_GET_SERVING, 0, NULL, 0);
++			wwan_req(PORT_WWAN_NAS2, ww_nas.node, ww_nas.port, NAS_GET_SIG_INFO, 0, NULL, 0);
++		}
++		if (ww_dms.up && ww_dms_asked) {
++			wwan_dms(DMS_GET_OPER_MODE);
++		}
++		if (ww_uim.up) {
++			wwan_req(PORT_WWAN_UIM, ww_uim.node, ww_uim.port, UIM_GET_CARD_STATUS, 0, NULL, 0);
+ 		}
+ 	}
+ }
+@@ -231,8 +248,8 @@
+ 		WWAN_LOG("set operating mode answered");
+ 		wwan_dms(DMS_GET_OPER_MODE);
+ 		ww_next_nas_ms = g_ms + 3000;   /* look at registration soon after */
+-		if (ww_nas_rounds >= 8) {
+-			ww_nas_rounds = 4;
++		if (ww_nas_rounds >= WW_ROUNDS) {
++			ww_nas_rounds = WW_ROUNDS - 4;
+ 		}
+ 		break;
+ 	}
+@@ -326,6 +343,17 @@
+ 	uint16_t l = 0;
+ 	const uint8_t *v;
+ 
++	if (msg == UIM_CHANGE_PROV) {
++		WWAN_LOG("provisioning session accepted");
++		ww_uim_again_ms = g_ms + 2000;
++		if (ww_prov_count >= 2 && !ww_nas2_bound && ww_nas.up) {
++			uint8_t sub = 1;
++			ww_nas2_bound = true;
++			WWAN_LOG("binding a second NAS client to subscription 2");
++			wwan_req(PORT_WWAN_NAS2, ww_nas.node, ww_nas.port, NAS_BIND_SUBS, 0x01, &sub, 1);
++		}
++		return;
++	}
+ 	if (msg != UIM_GET_CARD_STATUS) {
+ 		return;
+ 	}
+@@ -336,7 +364,9 @@
+ 	}
+ 	uint32_t o = 8;
+ 	unsigned cards = v[o++];
+-	WWAN_LOG("card status: %u slot(s)", cards);
++	/* session indexes: slot << 8 | application, ffff = none */
++	WWAN_LOG("card status: %u slot(s), sessions gw primary %02x%02x, gw secondary %02x%02x", cards,
++	    v[1], v[0], v[5], v[4]);
+ 	for (unsigned c = 0; c < cards && o + 6 <= l; c++) {
+ 		uint8_t st = v[o], err = v[o + 4], apps = v[o + 5];
+ 		WWAN_LOG("slot %u: card %s (error %u), upin state %u, %u app(s)", c + 1,
+@@ -351,6 +381,29 @@
+ 			const uint8_t *p = v + o + 7 + aidl;
+ 			WWAN_LOG("slot %u app %u: %s %s, perso %u, pin1 state %u (%u tries, puk %u)", c + 1, a + 1,
+ 			    type < 6 ? app[type] : "?", state < 8 ? ast[state] : "?", perso, p[1], p[2], p[3]);
++			if ((ww_flags & 8) && (type == 1 || type == 2) && state == 1 && c < 2 &&
++			    !ww_prov_asked[c] && ww_prov_count < 2 && aidl <= 16) {
++				/* TLV 1: session type, activate; TLV 0x10: slot, AID */
++				uint8_t b[40];
++				uint16_t txn = ww_txn++, m = UIM_CHANGE_PROV, n, tl;
++				uint8_t kind = ww_prov_count == 0 ? 0 : 2;      /* primary GW, secondary GW */
++
++				ww_prov_asked[c] = true;
++				ww_prov_count++;
++				b[0] = QMI_REQ;
++				memcpy(b + 1, &txn, 2);
++				memcpy(b + 3, &m, 2);
++				b[7] = 0x01; tl = 2; memcpy(b + 8, &tl, 2);
++				b[10] = kind; b[11] = 1;
++				b[12] = 0x10; tl = (uint16_t)(2 + aidl); memcpy(b + 13, &tl, 2);
++				b[15] = (uint8_t)(c + 1); b[16] = aidl;
++				memcpy(b + 17, v + o + 7, aidl);
++				n = (uint16_t)(10 + aidl);
++				memcpy(b + 5, &n, 2);
++				WWAN_LOG("slot %u: asking for a %s GW provisioning session on this %s (AID %u bytes)",
++				    c + 1, kind == 0 ? "primary" : "secondary", app[type], aidl);
++				qrtr_send(QRTR_TYPE_DATA, PORT_WWAN_UIM, ww_uim.node, ww_uim.port, b, 7u + n);
++			}
+ 			o += 7 + aidl + 7;
+ 		}
+ 	}
+@@ -363,7 +416,8 @@
+ 	uint16_t msg, err = 0xFFFF, res = 0xFFFF, l = 0;
+ 	const uint8_t *r;
+ 
+-	if (dst_port != PORT_WWAN_DMS && dst_port != PORT_WWAN_NAS && dst_port != PORT_WWAN_UIM) {
++	if (dst_port != PORT_WWAN_DMS && dst_port != PORT_WWAN_NAS && dst_port != PORT_WWAN_UIM &&
++	    dst_port != PORT_WWAN_NAS2) {
+ 		return false;
+ 	}
+ 	if (len < 7) {
+@@ -380,13 +434,21 @@
+ 	}
+ 	if (res != 0) {
+ 		WWAN_LOG("%s msg %04x: QMI error %u (result %u)", dst_port == PORT_WWAN_DMS ? "dms" :
+-		    dst_port == PORT_WWAN_NAS ? "nas" : "uim", msg, err, res);
++		    dst_port == PORT_WWAN_NAS ? "nas" : dst_port == PORT_WWAN_NAS2 ? "nas (subscription 2)" : "uim",
++		    msg, err, res);
+ 		return true;
+ 	}
+ 	if (dst_port == PORT_WWAN_DMS) {
+ 		ww_on_dms(msg, d, len);
+ 	} else if (dst_port == PORT_WWAN_NAS) {
+ 		ww_on_nas(msg, d, len);
++	} else if (dst_port == PORT_WWAN_NAS2) {
++		if (msg == NAS_BIND_SUBS) {
++			WWAN_LOG("second NAS client bound to subscription 2");
++		} else {
++			WWAN_LOG("subscription 2 says:");
++			ww_on_nas(msg, d, len);
++		}
+ 	} else {
+ 		ww_on_uim(msg, d, len);
+ 	}
