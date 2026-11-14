@@ -51,6 +51,10 @@ class SpesTests(unittest.TestCase):
         banks = [(0x40000000, 0x3dd00000), (0x80000000, 0x40000000), (0xc0000000, 0x80000000)]
         self.assertEqual(select_memory(fdt(banks), low_ram=True), (0xa0000000, 0xa0000000))
 
+    def test_full_ram_starts_behind_the_shim_payload_bound(self):
+        banks = [(0x40000000, 0x3dd00000), (0x80000000, 0x40000000), (0xc0000000, 0x80000000)]
+        self.assertEqual(select_memory(fdt(banks), full_ram=True), (0x8a000000, 0xb6000000))
+
     def test_default_stays_above_4gib_on_the_same_banks(self):
         banks = [(0x40000000, 0x3dd00000), (0x80000000, 0x40000000), (0xc0000000, 0x80000000)]
         self.assertEqual(select_memory(fdt(banks)), (0x100000000, 0x40000000))

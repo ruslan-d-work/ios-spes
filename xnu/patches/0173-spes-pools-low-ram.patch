@@ -1,0 +1,48 @@
+Move the scanout pool (0x90000000) and SpesModem's pool (0x9C000000) into the free low RAM
+0x63900000-0x7dcfffff, so XNU can own 0x8A000000-0x140000000 (2.84 GiB instead of 2.5 GiB).
+
+spesn live DT / Android iomem: 0x63900000-0x7dcfffff is System RAM with no reservation (420 MB).
+The scanout pool needs 192 MB below 4 GiB (32-bit MDP source address), the modem pool 16 MB
+below 0xF0000000: 0x64000000-0x70000000 and 0x70000000-0x71000000. XNU starts at 0x8A000000:
+ABL loads the shim at 0x80080000 and the loader's overlap check bounds the embedded payload at
+128 MB behind it (~0x880a0000); 0x8A000000 is the next 32 MB boundary.
+
+An ADT from mkadt.py --full-ram REQUIRES this kernel. An ADT from --low-ram (0xA0000000) also
+works with it.
+
+--- a/iokit/Kernel/arm/SpesModem.cpp
++++ b/iokit/Kernel/arm/SpesModem.cpp
+@@ -43,9 +43,10 @@
+ #define MDT_TYPE_HASH       (2u << 24)
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+-/* RAM the kernel does not manage, behind the scanout pool (0x90000000 + 192 MB, SweetSurface);
+- * below 0xF0000000 for TZ/the modem. XNU starts at 0xA0000000 (mkadt.py --low-ram). */
+-#define MODEM_POOL_BASE     0x9C000000ull
++/* RAM the kernel does not manage, behind the scanout pool (0x64000000 + 192 MB, SweetSurface),
++ * inside the free low RAM 0x63900000-0x7dcfffff; below 0xF0000000 for TZ/the modem.
++ * XNU starts at 0x8A000000 (mkadt.py --full-ram). */
++#define MODEM_POOL_BASE     0x70000000ull
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+ #define SMEM_PA             0x46000000ull
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -70,12 +70,13 @@
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+ /*
+- * Scanout pool: RAM below 4 GiB that XNU does not use on spes (all of XNU's RAM is above 4 GiB,
+- * and the display pipe's source address is 32 bits). Live DT: 0x80000000-0xc0000000 is RAM with
+- * no reservation; the shim's load area ends near 0x86000000, SpesModem's pool is at 0xe0000000.
++ * Scanout pool: RAM below 4 GiB that XNU does not use (the display pipe's source address is
++ * 32 bits). spesn live DT: 0x63900000-0x7dcfffff is System RAM with no reservation; XNU owns
++ * 0x8a000000-0x140000000 (mkadt.py --full-ram), the shim's load area ends near 0x86000000,
++ * SpesModem's pool follows this one at 0x70000000.
+  * Slots 0..10 hold screen-sized surfaces, slot 11 the framebuffer's black frame.
+  */
+-#define SWEET_SCANOUT_BASE      0x90000000ull
++#define SWEET_SCANOUT_BASE      0x64000000ull
+ #define SWEET_SCANOUT_SLOT      0x01000000ull   /* 16 MB, a 1125x2436 BGRA surface fits */
+ #define SWEET_SCANOUT_SLOTS     12
+ #define SWEET_SCANOUT_BLACK     11

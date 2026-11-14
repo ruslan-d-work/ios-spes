@@ -7,6 +7,9 @@ import struct
 
 # Below this: the shim's load area, the scanout pool (0x90000000 + 192 MB), the modem pool (0x9c000000 + 16 MB).
 LOW_RAM_BASE = 0xa0000000
+# Patch 0173 moves both pools to 0x64000000-0x71000000; below this only the shim (0x80080000) and the
+# 128 MB bound the loader puts on its embedded payload.
+FULL_RAM_BASE = 0x8a000000
 
 
 def parse(blob):
@@ -73,8 +76,8 @@ def merge_banks(banks):
     return merged
 
 
-def select_memory(blob, low_ram=False):
-    """low_ram: start at LOW_RAM_BASE. Needs a kernel with patch 0172 (modem pool moved)."""
+def select_memory(blob, low_ram=False, full_ram=False):
+    """low_ram: start at LOW_RAM_BASE (needs patch 0172). full_ram: start at FULL_RAM_BASE (needs 0173)."""
     nodes, reserved = parse(blob)
     root = nodes.get('', {})
     if b'qcom,khaje\0' not in root.get('compatible', b''):
@@ -107,7 +110,7 @@ def select_memory(blob, low_ram=False):
                 if not allocation or any(b + s > 0x100000000 for b, s in allocation):
                     raise ValueError('unresolved dynamic reservation above 4 GiB')
     candidates = []
-    floor = LOW_RAM_BASE if low_ram else 0x100000000
+    floor = FULL_RAM_BASE if full_ram else LOW_RAM_BASE if low_ram else 0x100000000
     for base, size in merge_banks(banks):
         if base + size <= floor:
             continue
