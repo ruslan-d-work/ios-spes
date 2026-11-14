@@ -11,7 +11,9 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  crash-loops and Setup blocks on its CoreTelephony XPC);
+                  bluetoothd removed (no BT transport: exits 0 and is
+                  relaunched on demand all the time)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -64,11 +66,15 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    # bluetoothd: no bluetooth IORegistry entry / no /dev/cu.bluetooth -> "No bluetooth on
+    # this device." and exit 0 in main, relaunched on demand by every Mach service lookup.
+    # Put it back when a kernel Bluetooth transport exists.
+    gone = ('com.apple.CommCenter', 'com.apple.bluetoothd')
+    removed = [k for k, j in jobs.items() if j.get('Label') in gone]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed ({", ".join(gone)})')
 
 
 def containers(root):
