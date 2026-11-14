@@ -1,4 +1,14 @@
-# HANDOFF 2026-11-14: XNU owns 2.84 GiB (0173), agents' side results pending review
+# HANDOFF 2026-11-15 01:00 (user went to sleep): k0179w1 booted, graphics split into two bugs, kernel batch 2 pending
+
+STATE: phone on, shim/out/spes-k0179w1.img (kernel 0179, wwan=1 spespmic=1), Wi-Fi joined (user), Metal build 43648981466 installed with NEGRONIMETAL_RTSIZE=full (unproven, harmless so far). Boot procedure now: over SSH /usr/local/libexec/spes-reboot.sh bootloader, then fastboot boot shim/out/spes-k0179w1.img; the clock restores itself. Live log: nc -ukl 5140 >> research/live-k0177va-b2.txt (all boots since 2026-11-14 evening are in that one file; last boot from line 216527).
+NEXT, in order:
+1. Ask the user (was asked, not answered): does the app switcher look different with RTSIZE=full; is the wallpaper whole on the home and lock screens.
+2. RTSIZE=full did NOT change the App Library backdrop (user). research/shots-20261114/IMG_0005.PNG, taken BEFORE Metal was on (software path), already shows it: backdrop in the top third, bright band, black below; IMG_0004.PNG from the same time shows the switcher correct. So: App Library backdrop = not a Metal bug (guess: the wallpaper picture the system prepares is short, 812 of 2436 rows; AegirPoster crashes each boot, CollectionsPoster has no Metal device; unchecked). Switcher black background/band = Metal only, cause unknown; neither knob was judged on the switcher.
+3. Kernel batch 2 (one CI build, user wants batches): GPU_SUBMIT_CMDS above 128; GPU backend recovery after a fault; microphone; camera sensor power-up + chip id; SIM PIN entry; operator name parsing; something for the modem 'Task starvation: ps' crash (CS-only service before provisioning is an untested idea). User chose none of these yet except that mic/camera were deferred to a second build.
+4. User must not open search in App Library on this kernel (GPU dies, see below).
+Details of everything above are in the 2026-11-14 entry below, newest lines near its end.
+
+# Entry 2026-11-14/15: XNU owns 2.84 GiB (0173), agents' side results pending review
 
 - 0173 (commit after 17889ca, CI 43585381641 -> xnu/out-0173, SHA OK): scanout pool 0x90000000 -> 0x64000000, modem pool 0x9C000000 -> 0x70000000 (free low RAM 0x63900000-0x7dcfffff, same in OrangeFox /proc/iomem). mkadt.py --full-ram: XNU 0x8A000000 + 0xB6000000 (2.84 GiB). NEVER use a --full-ram ADT with a kernel without 0173.
 - shim/out/spes-fullram.img (0173, spes-ram25 cmdline, sha256 0f65b13a2cd0...) booted 12:37 local, log research/live-fullram1.txt: no panic, SSH up, MODEM READY, wlfw msa_ready, wlan radio ready, scanout slot used. vm_stat right after boot: ~186k pages of 16 KB in total (= 2.84 GiB), wired 10717-11453 pages. User test pending.
