@@ -1,0 +1,84 @@
+spes: a finger and keys from SSH (0181): sysctl debug.spes_swipe and debug.spes_key.
+
+With debug.spes_fb_shot (0180) the pictures that are wrong (App Library backdrop black, Safari tab overview
+magenta, switcher backdrop grey) can be seen; opening those screens still needed the user each time. A swipe or
+tap given over SSH goes through sweet_hid_touch() like the panel's own reports.
+
+--- a/bsd/dev/spes_pmic.c
++++ b/bsd/dev/spes_pmic.c
+@@ -27,6 +27,7 @@
+ #include <sys/errno.h>
+ #include <sys/kauth.h>
+ #include <kern/kalloc.h>
++#include <IOKit/IOLib.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+@@ -299,6 +300,67 @@
+ SYSCTL_PROC(_debug, OID_AUTO, spes_fb_shot, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, spes_fb_shot_sysctl, "-", "spes: the picture on the display, BGRA after 8 bytes of size");
+ 
++/*
++ * debug.spes_swipe (0181, root only, write): a finger on the touchscreen, from SSH, so that a
++ * screen can be opened and looked at (debug.spes_fb_shot) with nobody holding the phone.
++ * One 64-bit number: x1 | y1 << 12 | x2 << 24 | y2 << 36 | (travel in 10 ms units) << 48 |
++ * (hold at the end in 100 ms units) << 56, in panel pixels. The finger goes down at x1,y1,
++ * moves to x2,y2 in that time (a report every 8 ms, as the panel gives them), stays there for
++ * the hold and goes up. A tap is x2,y2 = x1,y1 with a travel of 5. Finger 7: the panel's own
++ * reports use the low ids. debug.spes_key: key * 2 + down, straight to sweet_hid_key().
++ */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++
++static int
++spes_swipe_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	quad_t value = 0;
++	int error = sysctl_handle_quad(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	uint64_t v = (uint64_t)value;
++	int x1 = (int)(v & 0xfff), y1 = (int)((v >> 12) & 0xfff);
++	int x2 = (int)((v >> 24) & 0xfff), y2 = (int)((v >> 36) & 0xfff);
++	int travel = (int)((v >> 48) & 0xff) * 10, hold = (int)((v >> 56) & 0x7f) * 100;
++	int steps = travel / 8 > 0 ? travel / 8 : 1;
++
++	for (int i = 0; i <= steps; i++) {
++		sweet_hid_touch(7, 1, x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps);
++		IOSleep(8);
++	}
++	for (int waited = 0; waited < hold; waited += 8) {
++		sweet_hid_touch(7, 1, x2, y2);
++		IOSleep(8);
++	}
++	sweet_hid_touch(7, 0, x2, y2);
++	return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, spes_swipe, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, spes_swipe_sysctl, "Q", "spes: a finger from x1,y1 to x2,y2 (see spes_pmic.c)");
++
++static int
++spes_key_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = 0;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (value < 0 || value > 15) {
++		return EINVAL;
++	}
++	sweet_hid_key(value >> 1, value & 1);
++	return 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, spes_key, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, spes_key_sysctl, "I", "spes: key * 2 + down");
++
+ SYSCTL_PROC(_debug, OID_AUTO, spes_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, spes_reset_sysctl, "I", "spes: reset (1), to the bootloader (2), to the recovery (3)");
+ #endif
