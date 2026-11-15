@@ -1,6 +1,13 @@
 # HANDOFF 2026-11-15 01:00 (user went to sleep): k0179w1 booted, graphics split into two bugs, kernel batch 2 pending
 
 STATE: phone on, shim/out/spes-k0179w1.img (kernel 0179, wwan=1 spespmic=1), Wi-Fi joined (user), Metal build 43648981466 installed with NEGRONIMETAL_RTSIZE=full (unproven, harmless so far). Boot procedure now: over SSH /usr/local/libexec/spes-reboot.sh bootloader, then fastboot boot shim/out/spes-k0179w1.img; the clock restores itself. Live log: nc -ukl 5140 >> research/live-k0177va-b2.txt (all boots since 2026-11-14 evening are in that one file; last boot from line 216527).
+UPDATE 2026-11-15 11:45: kernel 0180 booted (shim/out/spes-k0180.img, CI 43699862161, commit 7d295e5, same cmdline as k0179w1, sha256 9f7b8ce635ef454e...; log from line 229455). CURRENT IMAGE.
+- tools/spes-shot.sh OUT.png: the display's picture through sysctl debug.spes_fb_shot (1080x2400). WORKS: research/shots-20261115/boot1.png shows the home screen on Metal, wallpaper (blue gradient), widget and icons whole. Use it instead of asking the user what the screen looks like.
+- Long GPU submissions (over 128 command buffers) now go in parts; not yet exercised (needs App Library search). The fault report prints the SMMU fault address.
+- fastboot set_active b done at this boot: slot-retry-count:b 7 (it had dropped to 3; boots through the power key cost one each, spes-reboot.sh does not).
+- If the phone answers 'Unrecognized command boot': it is in the recovery's fastbootd; 'fastboot reboot bootloader' first.
+- Sileo 'installs but nothing on the home screen': 2048 and p7zip from Procursus are command-line packages (/usr/bin/2048), no app. Suggested to the user: add https://repo.chariz.com/ and install NewTerm 3 Beta (ws.hbang.newterm3, iphoneos-arm, firmware >= 14) as the first app-with-icon test; not done yet.
+- Deleted xnu/out-0178 (superseded CI artifact).
 NEXT, in order:
 1. Ask the user (was asked, not answered): does the app switcher look different with RTSIZE=full; is the wallpaper whole on the home and lock screens.
 2. RTSIZE=full did NOT change the App Library backdrop (user). research/shots-20261114/IMG_0005.PNG, taken BEFORE Metal was on (software path), already shows it: backdrop in the top third, bright band, black below; IMG_0004.PNG from the same time shows the switcher correct. So: App Library backdrop = not a Metal bug (guess: the wallpaper picture the system prepares is short, 812 of 2436 rows; AegirPoster crashes each boot, CollectionsPoster has no Metal device; unchecked). Switcher black background/band = Metal only, cause unknown; neither knob was judged on the switcher.
