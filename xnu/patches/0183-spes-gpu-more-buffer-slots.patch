@@ -1,0 +1,17 @@
+spes GPU: 8192 buffer slots in the backend instead of 2048 (0183).
+
+2026-11-15 12:51: "reclaim for 131072 bytes: still no room; now 416 of 960 MB used, 2048 of 2048 buffers", "no addresses
+left for a buffer of 131072 bytes", then backboardd SIGSEGV at 0x16f0 in Turnip tu_bo_init_new_explicit_iova from
+tu_CreateGraphicsPipelines (a respring). The address space had room; the slots did not. 32 such lines since 2026-11-14.
+
+--- a/bsd/dev/spes_gpu_backend.h
++++ b/bsd/dev/spes_gpu_backend.h
+@@ -18,7 +18,7 @@
+ #define SPES_GPU_GRANULE 0x10000ull
+ #define SPES_GPU_GRANULES (SPES_GPU_SIZE_MAX / SPES_GPU_GRANULE)
+ #define SPES_GPU_TABLES (SPES_GPU_SIZE_MAX >> 21)
+-#define SPES_GPU_BUFFERS 2048u
++#define SPES_GPU_BUFFERS 8192u   /* 0183: 2048 filled up (backboardd crashed in Turnip on a NULL buffer), as RedwoodGPU's GPU_BUFFERS */
+ static struct {
+  bool ready, faulted, cacheable, best_fit;
+  vm_offset_t gpu, smmu, dma;
