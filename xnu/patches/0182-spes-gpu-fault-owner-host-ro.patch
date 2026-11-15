@@ -1,0 +1,83 @@
+spes GPU: say whose page a fault was on; boot-arg gpu_host_ro for read-only host imports (0182).
+
+Tiled mode (TU_DEBUG without sysmem) stops the GPU in seconds: FSR 0x80000408, fault address 0x25870000, FSYNR0
+0x20013 (a write, a permission fault); the same FSR came in sysmem mode after App Library search. 39 read-only host
+imports precede it. The report now names the buffer and the leaf entry; gpu_host_ro=1 refuses read-only imports,
+gpu_host_ro=2 maps them writable (experiment). Default 0: nothing changes.
+
+--- a/bsd/dev/spes_gpu_backend.h
++++ b/bsd/dev/spes_gpu_backend.h
+@@ -39,6 +39,8 @@
+  if (sg.gpu) touch_wr(sg.gpu, 0x2020u, 3u);
+ }
+ bool redwood_gpu_recover(void) { return false; }
++static int spes_gpu_owner(uint64_t address, uint64_t size);
++static uint64_t *spes_gpu_leaf(uint64_t address, bool create);
+ void redwood_gpu_report(const char *why) {
+  printf("SPES GPU: backend stopped: %s fence=%u tail=%u\n", why, sg.fence, sg.tail);
+  if (sg.gpu) {
+@@ -49,6 +51,20 @@
+   /* 0180: where the SMMU fault was (context FAR 0x60/0x64) and what kind (FSYNR0 0x68: bit 4 a write) */
+   printf("SPES GPU: fault address %#x:%#x FSYNR0=%#x\n", touch_rd(sg.smmu, sg.context + 0x64u),
+       touch_rd(sg.smmu, sg.context + 0x60u), touch_rd(sg.smmu, sg.context + 0x68u));
++  /* 0182: whose page that is and how it is mapped now (leaf bit 7: read-only for the GPU). A
++   * permission fault on a page that is writable now would be a stale TLB entry. */
++  {
++   uint64_t far = ((uint64_t)touch_rd(sg.smmu, sg.context + 0x64u) << 32) | touch_rd(sg.smmu, sg.context + 0x60u);
++   int owner = spes_gpu_owner(far & ~4095ull, 1);
++   uint64_t *leaf = spes_gpu_leaf(far & ~4095ull, false);
++   uint64_t entry = leaf ? *leaf : 0;
++   if (owner >= 0)
++    printf("SPES GPU: fault page is %llu bytes into buffer %d (base %#llx, %llu bytes), leaf %#llx: %s\n",
++        (far & ~4095ull) - sg.buffers[owner].base, owner, sg.buffers[owner].base, sg.buffers[owner].size, entry,
++        !(entry & 1) ? "not mapped" : (entry & 0x80) ? "read-only" : "writable");
++   else
++    printf("SPES GPU: fault page is in no buffer, leaf %#llx\n", entry);
++  }
+   printf("SPES GPU: SUBMIT_IB1 base=%#x:%#x remaining=%u\n",
+       touch_rd(sg.gpu, 0x24a4u), touch_rd(sg.gpu, 0x24a0u), touch_rd(sg.gpu, 0x24a8u));
+  }
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1256,6 +1256,7 @@
+ RedwoodGPUUserClient::hostBuffer(struct redwood_userptr * request)
+ {
+ 	bool readOnly = (request->flags & kUserptrReadOnly) != 0;
++	static uint32_t host_ro = ~0u, host_ro_said;
+ 	IOMemoryDescriptor * memory;
+ 	IOMemoryMap * map;
+ 	struct gpu_buffer * b;
+@@ -1268,6 +1269,24 @@
+ 	if (current_task() != fTask) {
+ 		return kIOReturnNotPermitted;
+ 	}
++	/*
++	 * 0182: the GPU stopped twice on a write to a page mapped read-only for it (FSR 0x80000408,
++	 * FSYNR0 0x20013), with read-only host imports just before. Boot-arg gpu_host_ro: 0 as
++	 * before (default); 1 refuses a read-only import, so the program makes its own copy in a
++	 * buffer the GPU may write; 2 maps the import writable for the GPU (an experiment: the pages
++	 * are not this program's to write).
++	 */
++	if (host_ro == ~0u) {
++		uint32_t v = 0;
++		(void)PE_parse_boot_argn("gpu_host_ro", &v, sizeof(v));
++		host_ro = v;
++	}
++	if (readOnly && host_ro == 1) {
++		if (host_ro_said++ < 4) {
++			IOLog("RedwoodGPU: host import of %#llx (+%llu): read-only, refused (gpu_host_ro=1)\n", request->pointer, request->size);
++		}
++		return kIOReturnNotWritable;
++	}
+ 	memory = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)request->pointer, (mach_vm_size_t)request->size,
+ 	    readOnly ? kIODirectionOut : kIODirectionInOut, fTask);
+ 	if (memory == NULL) {
+@@ -1288,7 +1307,7 @@
+ 	hostPush(memory, request->size);
+ 	redwood_gpu_to_memory(NULL, 0);
+ 	IOLockLock(gGPULock);
+-	b = newBuffer(memory, 0, request->size, readOnly ? MSM_BO_GPU_READONLY : 0, &request->handle);
++	b = newBuffer(memory, 0, request->size, readOnly && host_ro != 2 ? MSM_BO_GPU_READONLY : 0, &request->handle);
+ 	if (b != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = NULL;
