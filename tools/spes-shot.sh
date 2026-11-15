@@ -5,7 +5,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd); out=${1:?usage: spes-shot.sh OUT.png [SCALE]}; scale=${2:-4}
 raw=$(mktemp); trap 'rm -f "$raw"' EXIT
 ssh -i "$root/research/ssh/id_ed25519" -o IdentitiesOnly=yes -o UserKnownHostsFile="$root/research/ssh/known_hosts" \
-    -o ConnectTimeout=8 root@192.168.7.2 '/usr/sbin/sysctl -b debug.spes_fb_shot' > "$raw"
+    -o ConnectTimeout=8 root@192.168.7.2 '/usr/sbin/sysctl -b debug.spes_fb_shot | gzip -1' | gunzip > "$raw"   # gzip: 1 s instead of 9
 python3 - "$raw" "$out" "$scale" <<'PY'
 import struct, sys
 from PIL import Image
