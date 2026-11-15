@@ -1,0 +1,35 @@
+spes: SPES_M2V_HOST_LINEAR=1 takes a host-allocation linear image although Turnip asks a dedicated allocation of it.
+
+Runtime message (backboardd, 2026-11-15): "a 2D BGRA8Unorm texture of 64x64 over a buffer ... the buffer is a no-copy
+buffer, and the device makes no linear image of the texture: it asks a dedicated allocation of a linear image of
+VK_FORMAT_B8G8R8A8_UNORM for host allocations ... its texels are copied into an image before each use and back after
+each write". Turnip sets requiresDedicatedAllocation for any image with external handle types. Off by default.
+
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2712,7 +2712,13 @@
+             unsafe { raw_device.get_image_memory_requirements2(&query, &mut requirements) };
+             requirements.memory_requirements
+         };
+-        if dedicated.requires_dedicated_allocation != vk::FALSE {
++        // spes: Turnip answers requiresDedicatedAllocation for every image made with an external
++        // memory handle type (tu_image.cc: `shareable`), host allocations included, though binding
++        // one at an offset of an imported host range is what tu_BindImageMemory2 does for any image.
++        // Refusing it made every IOSurface texture over a no-copy buffer a shadow, copied in before
++        // each encoder and back after (2026-11-15: ~150 full-screen copies a second on the A610).
++        // SPES_M2V_HOST_LINEAR=1 in the process's environment takes the image all the same.
++        if dedicated.requires_dedicated_allocation != vk::FALSE && !spes_host_linear() {
+             // SAFETY: the image is live and unbound, and no command uses it.
+             unsafe { release::object(raw_device, raw) };
+             return Ok(Err(LinearRefusal::Dedicated));
+@@ -5802,3 +5808,10 @@
+     /// (`two_planes.rs`).
+     planes: bool,
+ }
++
++/// spes: whether `SPES_M2V_HOST_LINEAR=1` asks a host-allocation linear image to be taken although
++/// the driver asks a dedicated allocation of it (`host_linear_image`). Read once.
++fn spes_host_linear() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("SPES_M2V_HOST_LINEAR").is_some_and(|v| v == "1"))
++}
