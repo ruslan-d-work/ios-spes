@@ -1,0 +1,223 @@
+spes: the picture on the display through sysctl, long GPU submissions in parts, the GPU fault address (0180).
+
+1. debug.spes_fb_shot (root): the pixels the display shows now (the scanned surface or the panel
+   memory). Screenshots are black when backboardd draws with Metal; the App Library backdrop and
+   the switcher have to be seen to be debugged. "sysctl -b debug.spes_fb_shot > file".
+2. RedwoodGPU refused a submission of more than 128 command buffers (App Library's search: 130),
+   and backboardd's Vulkan device was lost for good. Up to 4096 are taken now and go to the ring
+   128 at a time; the fence is the last part's.
+3. The backend's fault report also prints the SMMU fault address and FSYNR0 ('backend stopped:
+   fault while waiting for a fence', FSR 0x80000408, cause unknown).
+
+--- a/bsd/dev/spes_gpu_backend.h
++++ b/bsd/dev/spes_gpu_backend.h
+@@ -46,6 +46,9 @@
+       touch_rd(sg.gpu, 0x2018u), sg.tail, touch_rd(sg.gpu, 0x208cu),
+       touch_rd(sg.gpu, 0x2084u), touch_rd(sg.gpu, 0x804u),
+       touch_rd(sg.smmu, 0x48u), touch_rd(sg.smmu, sg.context + 0x58u));
++  /* 0180: where the SMMU fault was (context FAR 0x60/0x64) and what kind (FSYNR0 0x68: bit 4 a write) */
++  printf("SPES GPU: fault address %#x:%#x FSYNR0=%#x\n", touch_rd(sg.smmu, sg.context + 0x64u),
++      touch_rd(sg.smmu, sg.context + 0x60u), touch_rd(sg.smmu, sg.context + 0x68u));
+   printf("SPES GPU: SUBMIT_IB1 base=%#x:%#x remaining=%u\n",
+       touch_rd(sg.gpu, 0x24a4u), touch_rd(sg.gpu, 0x24a0u), touch_rd(sg.gpu, 0x24a8u));
+  }
+--- a/bsd/dev/spes_pmic.c
++++ b/bsd/dev/spes_pmic.c
+@@ -25,6 +25,8 @@
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
+ #include <sys/errno.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+@@ -260,6 +262,43 @@
+ 	printf("SPES PMIC: still running 3 s after PS_HOLD was dropped\n");
+ 	return EIO;
+ }
++/*
++ * debug.spes_fb_shot (0180, root only): what the display shows now. 8 bytes of width and
++ * height, then width x height BGRA pixels (sweet_fb_shot in SweetFramebuffer.cpp). Read it
++ * with "sysctl -b debug.spes_fb_shot > file". Not gated by spespmic: no PMIC involved.
++ */
++extern uint32_t sweet_fb_shot(uint8_t *dst, uint32_t size, uint32_t *dims);
++
++static int
++spes_fb_shot_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t dims[2] = { 0, 0 };
++	uint32_t need = sweet_fb_shot(NULL, 0, dims);
++
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (need == 0) {
++		return ENXIO;
++	}
++	if (req->oldptr == USER_ADDR_NULL) {
++		req->oldidx = (size_t)need + 8;
++		return 0;
++	}
++	uint8_t *pixels = kalloc_data((size_t)need + 8, Z_WAITOK);
++	if (pixels == NULL) {
++		return ENOMEM;
++	}
++	memcpy(pixels, dims, 8);
++	(void)sweet_fb_shot(pixels + 8, need, dims);
++	int error = SYSCTL_OUT(req, pixels, (size_t)need + 8);
++	kfree_data(pixels, (size_t)need + 8);
++	return error;
++}
++SYSCTL_PROC(_debug, OID_AUTO, spes_fb_shot, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, spes_fb_shot_sysctl, "-", "spes: the picture on the display, BGRA after 8 bytes of size");
++
+ SYSCTL_PROC(_debug, OID_AUTO, spes_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, spes_reset_sysctl, "I", "spes: reset (1), to the bootloader (2), to the recovery (3)");
+ #endif
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -219,7 +219,8 @@
+ 
+ #define GPU_BUFFERS             8192            /* a client's, at most */
+ #define GPU_BUFFER_MAX          (256u << 20)
+-#define GPU_SUBMIT_CMDS         128
++#define GPU_SUBMIT_CMDS         128             /* command buffers given to the ring at a time */
++#define GPU_SUBMIT_CMDS_MAX     4096            /* 0180: in one submission; more than 128 go in parts */
+ #define GPU_SUBMIT_BOS          8192
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+@@ -570,6 +571,7 @@
+ 	uint32_t                fBufferCount;
+ 	uint64_t                fBufferBytes;
+ 	uint32_t                fSubmits;
++	uint32_t                fLongSubmits;   /* 0180: submissions that went to the ring in parts */
+ 	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
+ 	struct gpu_left         fLeft[GPU_LEFT];
+ 	uint32_t                fLeftCount;
+@@ -1355,11 +1357,12 @@
+ 	struct msm_gem_submit_bo * bos = NULL;
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+ 	uint64_t addresses[GPU_SUBMIT_CMDS];
+-	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	uint32_t words[GPU_SUBMIT_CMDS], count = 0, parts = 0, part = 0;
++	bool part_failed = false;
+ 	uint64_t began, nanos, again;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+-	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
++	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS_MAX || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+ 		IOLog("RedwoodGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -1445,10 +1448,34 @@
+ 			IOLockUnlock(gGPULock);
+ 			goto out;
+ 		}
++		/*
++		 * 0180: App Library's search gave 130 command buffers in one submission; refusing it
++		 * lost backboardd its device. The ring takes GPU_SUBMIT_CMDS at a time, in order, so
++		 * a longer submission goes in parts and is done when its last part is.
++		 */
++		if (count == GPU_SUBMIT_CMDS) {
++			part = redwood_gpu_submit(addresses, words, count);
++			if (part == 0) {
++				part_failed = true;
++				break;
++			}
++			parts++;
++			count = 0;
++		}
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+ 		words[count++] = cmds[i].size / 4;
+ 	}
+-	request->fence = redwood_gpu_submit(addresses, words, count);
++	if (part_failed) {
++		request->fence = 0;
++	} else if (count == 0 && part != 0) {
++		request->fence = part;
++	} else {
++		request->fence = redwood_gpu_submit(addresses, words, count);
++	}
++	if (parts != 0 && fLongSubmits++ < 8) {
++		IOLog("RedwoodGPU: a submission of %u command buffers went in %u parts, fence %u\n", request->nr_cmds,
++		    parts + (count != 0), request->fence);
++	}
+ 	/*
+ 	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
+ 	 * reset and given this submission again -- after a reset the ring is empty, so there is
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -198,6 +198,7 @@
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	bool present(const uint8_t *rec, SweetSurface **surfaces);
++	uint32_t shot(uint8_t *dst, uint32_t size, uint32_t *dims);     /* 0180 */
+ };
+ 
+ /* Adapted from ios-topaz 0138: avoid QuartzCore's 30-second service wait.
+@@ -242,6 +243,8 @@
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++static AppleCLCD *gShotFB;      /* 0180: the display, for sweet_fb_shot() */
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -465,9 +468,54 @@
+ 	OSSafeReleaseNULL(bl);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	gShotFB = this;
+ 	return true;
+ }
+ 
++/*
++ * spes 0180: what the display shows now, fWidth x fHeight BGRA rows without padding, for
++ * sysctl debug.spes_fb_shot. Screenshots come out black when backboardd draws with Metal,
++ * and a picture that is wrong has to be seen. The surface the pipe scans if there is one,
++ * else the panel memory. The GPU's pixels are in memory, not in this processor's cache:
++ * the lines are cleaned and dropped first. Returns the bytes needed; copies nothing if
++ * dst is NULL or too small.
++ */
++uint32_t
++AppleCLCD::shot(uint8_t *dst, uint32_t size, uint32_t *dims)
++{
++	uint32_t need = fWidth * fHeight * 4;
++
++	dims[0] = fWidth;
++	dims[1] = fHeight;
++	if (dst == NULL || size < need) {
++		return need;
++	}
++	IOLockLock(fLock);
++	SweetSurface *on = fScanned[0];
++	uintptr_t from = fPixels;
++	uint32_t pitch = fRowBytes;
++	if (on != NULL && on->kernelAddress() != 0 && on->bytesPerRow >= fWidth * 4) {
++		from = on->kernelAddress() + on->offset + (uint64_t)fOffY * on->bytesPerRow + (uint64_t)fOffX * 4;
++		pitch = on->bytesPerRow;
++	}
++	for (uintptr_t line = from & ~(uintptr_t)63; line < from + (uint64_t)pitch * fHeight; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t y = 0; y < fHeight; y++) {
++		memcpy(dst + (size_t)y * fWidth * 4, (const void *)(from + (uint64_t)y * pitch), (size_t)fWidth * 4);
++	}
++	IOLockUnlock(fLock);
++	return need;
++}
++
++extern "C" uint32_t sweet_fb_shot(uint8_t *dst, uint32_t size, uint32_t *dims);
++uint32_t
++sweet_fb_shot(uint8_t *dst, uint32_t size, uint32_t *dims)
++{
++	return gShotFB != NULL ? gShotFB->shot(dst, size, dims) : 0;
++}
++
+ void
+ AppleARMBacklight::publish(uint32_t level)
+ {
