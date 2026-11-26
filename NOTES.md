@@ -1,6 +1,14 @@
 # HANDOFF 2026-11-15 01:00 (user went to sleep): k0179w1 booted, graphics split into two bugs, kernel batch 2 pending
 
 STATE: phone on, shim/out/spes-k0179w1.img (kernel 0179, wwan=1 spespmic=1), Wi-Fi joined (user), Metal build 43648981466 installed with NEGRONIMETAL_RTSIZE=full (unproven, harmless so far). Boot procedure now: over SSH /usr/local/libexec/spes-reboot.sh bootloader, then fastboot boot shim/out/spes-k0179w1.img; the clock restores itself. Live log: nc -ukl 5140 >> research/live-k0177va-b2.txt (all boots since 2026-11-14 evening are in that one file; last boot from line 216527).
+UPDATE 2026-11-26 10:50: kernel 0183 booted again (shim/out/spes-k0183.img, no extra args; log from line 343061 of research/live-k0177va-b2.txt). CURRENT IMAGE. backboardd lost the Metal race again (killall backboardd at ~10:55 -> Turnip in 972 ms).
+- SWIPE-UP DOES NOT REPRODUCE TODAY. Shots research/shots-20261126/*-pair.png (left: lock screen after power off/on, right: 4 s after the swipe). The boot came up unlocked, already in Settings > Wi-Fi.
+  - Software path: home swipe in an app 540,2399->540,1000 goes home; lock screen 540,2399->540,300 (250 ms) unlocks (l2a); the user's short swipe 480,2399->421,1890 (200 ms) unlocks (l2e).
+  - Metal path (after killall backboardd): the same two lock-screen swipes unlock (m2a, m2e), each right after 'SWEET FB: display off' / 'display on' from the power key.
+  - So finger 7, the edge bit, the 18 px logical offset and display off/on are NOT the cause by themselves. No AKS call failed this boot.
+  - No auto-lock happened in 150 s idle (on the charger); the idle-timer path is untested.
+  - Untested differences from the failing boots (2026-11-14/15): the lock screen shown at boot before the first unlock; high load or a GPU fault at the time; a long uptime.
+- The lock screen on the software path shows black rectangles over the lower half (l2a-before); on Metal the clock was sometimes missing in the first frame (m2a-before). Not investigated.
 UPDATE 2026-11-15 11:45: kernel 0180 booted (shim/out/spes-k0180.img, CI 43699862161, commit 7d295e5, same cmdline as k0179w1, sha256 9f7b8ce635ef454e...; log from line 229455). CURRENT IMAGE.
 - tools/spes-shot.sh OUT.png: the display's picture through sysctl debug.spes_fb_shot (1080x2400). WORKS: research/shots-20261115/boot1.png shows the home screen on Metal, wallpaper (blue gradient), widget and icons whole. Use it instead of asking the user what the screen looks like.
 - Long GPU submissions (over 128 command buffers) now go in parts; not yet exercised (needs App Library search). The fault report prints the SMMU fault address.
