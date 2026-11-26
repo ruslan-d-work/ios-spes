@@ -1,0 +1,64 @@
+spes: textures over the planes of a planar IOSurface (flame patch 0003).
+
+newTextureWithDescriptor:iosurface:plane: returned nil for any surface with planes. The 420f surfaces (SpringBoard's
+787x1705 and 1125x2436 app snapshots, CollectionsPoster's previews, assetsd thumbnails: 214 of them in one boot) then
+had no textures, and CoreAnimation's YCbCr pass drew magenta with black specks: Safari's tab overview and its card in the
+switcher. Each plane now gets a texture over the one import of the whole allocation, at the plane's offset with its rows
+(the runtime's IoSurfacePlane, tested in metal2vulkan-validation ycbcr_textures.rs); iosurfacePlane answers the plane.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -155,6 +155,7 @@
+ @property(nonatomic,strong) NBBuffer *buffer;
+ @property(nonatomic) IOSurfaceRef surface;
+ @property(nonatomic) NSUInteger offset,rowBytes;
++@property(nonatomic) NSUInteger plane;   // spes (flame 0003): the IOSurface plane it shows
+ @property(nonatomic) NSUInteger parentLevel,parentSlice;   // NegroniMetal: a view's first level and slice in its parent
+ @property(nonatomic) uint64_t passSeen;   // spes: the levels and slices (bit level*4+slice) a render pass has targeted (NEGRONIMETAL_DONTCARE=first)
+ @property(nonatomic,strong) id<MTLTexture> parent;
+@@ -325,7 +326,7 @@
+ - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+ - (BOOL)isFramebufferOnly {return NO;}
+ - (IOSurfaceRef)iosurface {return _surface;}
+-- (NSUInteger)iosurfacePlane {return 0;}
++- (NSUInteger)iosurfacePlane {return _plane;}
+ - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
+ - (NSUInteger)bufferOffset {return _offset;}
+ - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
+@@ -346,6 +347,7 @@
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
+  if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
++ view.plane=_plane;
+  if(gTraceLeft.load()>0 && traceBig(view))traceLine("view %s",traceTex(view).c_str());   // spes trace
+  return (id<MTLTexture>)view;
+ }
+@@ -1908,13 +1910,25 @@
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
+- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
++ // spes (flame 0003): planar surfaces (420f snapshots, thumbnails) get one texture a plane, over the same import of the whole
++ // allocation at the plane's offset and rows. Refusing them left CoreAnimation's YCbCr pass without textures: magenta cards.
++ const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
++ if(!surface || !d || (planes?plane>=planes:plane!=0))return nil;
+  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+  const size_t bytes=(allocation+page-1)&~(page-1);
++ size_t offset=0,row=IOSurfaceGetBytesPerRow(surface);
++ if(planes) {
++  const uintptr_t at=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane);row=IOSurfaceGetBytesPerRowOfPlane(surface,plane);
++  if(at<(uintptr_t)base || at-(uintptr_t)base>=allocation || !row){
++   NBLOG(@"native-metal: surface %u plane %lu of %lu outside its allocation",IOSurfaceGetID(surface),(unsigned long)plane,(unsigned long)planes);return nil;}
++  offset=at-(uintptr_t)base;
++ }
+  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
+- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
+- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
++ NBTexture *texture=textureOnBuffer(buffer,d,offset,row,true);
++ if(!texture){if(planes)NBLOG(@"native-metal: surface %u plane %lu (offset %lu rows %lu format %lu %lux%lu) refused",IOSurfaceGetID(surface),
++   (unsigned long)plane,(unsigned long)offset,(unsigned long)row,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height);return nil;}
++ texture.surface=(IOSurfaceRef)CFRetain(surface);texture.plane=plane;return (id<MTLTexture>)texture;
+ }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
