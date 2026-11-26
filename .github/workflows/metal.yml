@@ -29,7 +29,10 @@ jobs:
 
       - name: Host tools
         run: |
-          brew install bison flex llvm ninja glslang
+          # flex: Apple's 2.6.4 from the command line tools; Homebrew's 2.6.16 (2026-11) makes ir3_lexer.c strict POSIX,
+          # which hides Dl_info and the byte-order macros in Apple's headers (run 45793537294).
+          brew install bison llvm ninja glslang
+          flex --version
           # The runner's default Xcode: 16.0's linker drops LC_DYLD_CHAINED_FIXUPS with -undefined
           # dynamic_lookup, and the old format imports dyld_stub_binder, local in the 20H392 libdyld.
           xcodebuild -version

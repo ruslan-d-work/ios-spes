@@ -38,7 +38,7 @@ PY
   find "$src" -name '*.orig' -delete
   touch "$src/.spes-turnip"
 fi
-export PATH="$root/research/mesa-build/venv/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
+export PATH="$root/research/mesa-build/venv/bin:/opt/homebrew/opt/bison/bin:$PATH"
 cat > "$b/cross.ini" <<INI
 [binaries]
 c = ['/usr/bin/clang', '-target', 'arm64-apple-ios16.0', '-mcpu=cortex-a53', '-isysroot', '$sdk']
